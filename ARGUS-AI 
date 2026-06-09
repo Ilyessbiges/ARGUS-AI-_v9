@@ -1,0 +1,4212 @@
+python
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+╔══════════════════════════════════════════════════════════════════════════════════════════╗
+║          ARGUS-AI IDS v9.0 — Cognitive Defence Platform  (Kali Professional)            ║
+║  wlan0/wlan1 · Monitor · Cython · eBPF · Zeek · SQLite/PostgreSQL · LightGBM            ║
+║  YARA · JA3/JA3S · CVE · LLM · RL Agent · 802.11 · ARP Spoof · PMKID                  ║
+║  GeoIP · Threat-Intel · SSH BruteForce · HTTP Anomaly · DNS Tunnel · Lateral Movement   ║
+║  Port-Scan · Data-Exfil · PCAP Export · Incident Playbook · HTML Report                 ║
+╠══════════════════════════════════════════════════════════════════════════════════════════╣
+║  DÉMARRAGE RAPIDE (Kali Linux):                                                          ║
+║    sudo python3 argus_ids_v9_kali.py --wlan0 wlan0 --wlan1 wlan1 --auto-block           ║
+║    sudo python3 argus_ids_v9_kali.py --simulate --port 5000                              ║
+║    sudo python3 argus_ids_v9_kali.py --wlan0 wlan0 --monitor --enable-rl --enable-lgbm  ║
+╚══════════════════════════════════════════════════════════════════════════════════════════╝
+"""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMPORTS STANDARD
+# ══════════════════════════════════════════════════════════════════════════════
+import os, sys, json, math, time, struct, queue, random, logging, csv, gzip
+import hashlib, argparse, threading, signal, re, pickle, subprocess, socket
+import ipaddress, statistics, base64, hmac, zlib
+from copy import deepcopy
+from datetime import datetime, timedelta
+from pathlib import Path
+from collections import defaultdict, deque, Counter
+from dataclasses import dataclass, field, asdict
+from typing import Optional, Dict, List, Any, Tuple, Set
+from urllib.parse import urlparse, unquote
+from io import StringIO
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IMPORTS TIERS — dégradation gracieuse
+# ══════════════════════════════════════════════════════════════════════════════
+try:
+    import yaml; YAML_OK = True
+except ImportError:
+    YAML_OK = False; print("[WARN] pip install pyyaml")
+
+try:
+    import numpy as np; NP_OK = True
+except ImportError:
+    NP_OK = False; print("[WARN] pip install numpy")
+
+try:
+    import joblib; JOBLIB_OK = True
+except ImportError:
+    JOBLIB_OK = False
+
+try:
+    from sklearn.linear_model import SGDRegressor
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.ensemble import IsolationForest
+    SK_OK = True
+except ImportError:
+    SK_OK = False; print("[WARN] pip install scikit-learn")
+
+try:
+    import lightgbm as lgb; LGBM_OK = True
+except ImportError:
+    LGBM_OK = False; print("[WARN] pip install lightgbm")
+
+try:
+    import yara; YARA_OK = True
+except ImportError:
+    YARA_OK = False; print("[WARN] pip install yara-python")
+
+try:
+    from scapy.all import (
+        sniff, IP, IPv6, TCP, UDP, Raw, DNS, DNSQR, DNSRR, ARP,
+        Ether, RadioTap, Dot11, Dot11Beacon, Dot11Elt,
+        Dot11ProbeReq, Dot11ProbeResp, Dot11Auth, Dot11Deauth,
+        EAPOL, ICMP, conf as scapy_conf, wrpcap, rdpcap, PcapWriter
+    )
+    SCAPY_OK = True
+except ImportError:
+    SCAPY_OK = False; print("[WARN] pip install scapy")
+
+try:
+    from flask import Flask, render_template_string, jsonify, request as freq, send_file
+    from flask_socketio import SocketIO
+    FLASK_OK = True
+except ImportError:
+    FLASK_OK = False; print("[WARN] pip install flask flask-socketio")
+
+try:
+    import requests as http_req; REQUESTS_OK = True
+except ImportError:
+    REQUESTS_OK = False
+
+try:
+    from sqlalchemy import (create_engine, Column, Integer, Float,
+                            String, Text, Index, Boolean, text, DateTime)
+    from sqlalchemy.orm import declarative_base, sessionmaker
+    from sqlalchemy.pool import StaticPool
+    SA_OK = True
+except ImportError:
+    SA_OK = False; print("[WARN] pip install sqlalchemy")
+
+try:
+    import geoip2.database; GEOIP_OK = True
+except ImportError:
+    GEOIP_OK = False  # pip install geoip2 + télécharger GeoLite2-City.mmdb
+
+try:
+    import argus_cext as _cext; CEXT_OK = True
+except ImportError:
+    CEXT_OK = False
+
+try:
+    from bcc import BPF; EBPF_OK = True
+except ImportError:
+    EBPF_OK = False
+
+try:
+    from jinja2 import Template; JINJA_OK = True
+except ImportError:
+    JINJA_OK = False
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 0 — FICHIERS CYTHON
+# ══════════════════════════════════════════════════════════════════════════════
+
+CYTHON_PYX = '''
+# argus_cext.pyx — Extensions C pour ARGUS v9
+from libc.math cimport log2
+from libc.string cimport memset
+import numpy as np
+
+cpdef double c_entropy_bytes(bytes data):
+    cdef int counts[256]
+    cdef int n = len(data)
+    cdef double p, r = 0.0
+    cdef int i
+    if n == 0: return 0.0
+    memset(counts, 0, sizeof(counts))
+    for i in range(n): counts[<unsigned char>data[i]] += 1
+    for i in range(256):
+        if counts[i] > 0:
+            p = counts[i] / <double>n
+            r -= p * log2(p)
+    return r
+
+cpdef double c_entropy_str(str s):
+    cdef int n = len(s)
+    cdef double p, r = 0.0
+    if n == 0: return 0.0
+    freq = {}
+    for ch in s: freq[ch] = freq.get(ch, 0) + 1
+    for count in freq.values():
+        p = count / <double>n
+        r -= p * log2(p)
+    return r
+
+cpdef double c_consonant_ratio(str s):
+    cdef int alpha = 0, cons = 0
+    for ch in s.lower():
+        if ch.isalpha():
+            alpha += 1
+            if ch not in "aeiou": cons += 1
+    return cons / <double>alpha if alpha > 0 else 0.0
+
+cpdef bint c_nop_sled(bytes data, int threshold=16):
+    cdef int count = 0, i, n = len(data)
+    for i in range(n):
+        if <unsigned char>data[i] == 0x90:
+            count += 1
+            if count >= threshold: return True
+        else:
+            count = 0
+    return False
+
+cpdef tuple c_parse_ja3_fields(bytes payload):
+    cdef int length = len(payload), offset, session_len
+    cdef int cipher_len, comp_len, ext_total, end
+    cdef int ext_type, ext_len, version, i
+    cdef list ciphers = [], exts = []
+    if length < 5 or <unsigned char>payload[0] != 0x16:
+        return (None, None, None)
+    version = (<unsigned char>payload[1] << 8) | <unsigned char>payload[2]
+    offset = 43
+    if offset >= length: return (None, None, None)
+    session_len = <unsigned char>payload[offset]
+    offset += 1 + session_len
+    if offset + 2 > length: return (None, None, None)
+    cipher_len = (<unsigned char>payload[offset] << 8) | <unsigned char>payload[offset+1]
+    offset += 2
+    for i in range(0, cipher_len, 2):
+        if offset+i+2 <= length:
+            ciphers.append(str((<unsigned char>payload[offset+i]<<8)|<unsigned char>payload[offset+i+1]))
+    offset += cipher_len
+    if offset < length:
+        comp_len = <unsigned char>payload[offset]
+        offset += 1 + comp_len
+    if offset + 2 <= length:
+        ext_total = (<unsigned char>payload[offset]<<8)|<unsigned char>payload[offset+1]
+        offset += 2; end = offset + ext_total
+        while offset + 4 <= end and offset + 4 <= length:
+            ext_type = (<unsigned char>payload[offset]<<8)|<unsigned char>payload[offset+1]
+            ext_len  = (<unsigned char>payload[offset+2]<<8)|<unsigned char>payload[offset+3]
+            exts.append(str(ext_type)); offset += 4 + ext_len
+    return (str(version), ",".join(ciphers), ",".join(exts))
+
+cpdef bint c_is_dns_tunnel(str label, int min_len=45):
+    cdef int n = len(label)
+    if n < min_len: return False
+    cdef double ent = c_entropy_str(label)
+    cdef double cr  = c_consonant_ratio(label)
+    return ent > 3.8 and cr > 0.72
+'''
+
+CYTHON_SETUP = '''
+from setuptools import setup, Extension
+from Cython.Build import cythonize
+import numpy
+extensions = [Extension("argus_cext", sources=["argus_cext.pyx"],
+    extra_compile_args=["-O3","-march=native","-ffast-math"],
+    include_dirs=[numpy.get_include()])]
+setup(name="argus_cext", ext_modules=cythonize(extensions,
+    compiler_directives={"language_level":"3","boundscheck":False,
+    "wraparound":False,"cdivision":True,"nonecheck":False}))
+'''
+
+def generate_cython_files():
+    Path("argus_cext.pyx").write_text(CYTHON_PYX)
+    Path("setup_argus.py").write_text(CYTHON_SETUP)
+    print("[+] Cython source généré : argus_cext.pyx + setup_argus.py")
+    print("    Compiler : python3 setup_argus.py build_ext --inplace")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — CONFIGURATION GLOBALE
+# ══════════════════════════════════════════════════════════════════════════════
+
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "interfaces": {
+        "wlan0":          "wlan0",
+        "wlan1":          "wlan1",
+        "monitor_iface":  "wlan1mon",
+        "auto_block":     False,
+        "learning_mode":  False,
+        "monitor_mode":   False,
+    },
+    "use_brain":      True,
+    "log_level":      "INFO",
+    "output_dir":     "output",
+    "siem_file":      "output/siem_export.jsonl",
+    "model_path":     "models/dga_model.pkl",
+    "yara_rules":     "rules/yara_rules.yar",
+    "dashboard_port": 5000,
+    "pcap_dir":       "output/pcap",
+    "report_dir":     "output/reports",
+    "geoip_db":       "data/GeoLite2-City.mmdb",
+    "threat_intel": {
+        "enabled":        True,
+        "local_ioc_file": "data/ioc_list.txt",
+        "feeds": [
+            "https://rules.emergingthreats.net/blockrules/compromised-ips.txt",
+        ],
+        "refresh_hours":  6,
+    },
+    "database": {
+        "url":      "sqlite:///output/argus.db",
+        "wal_mode": True,
+        "echo":     False,
+    },
+    "zeek": {
+        "enabled":       False,
+        "log_dir":       "/opt/zeek/logs/current",
+        "logs":          ["dns.log","ssl.log","conn.log","files.log","weird.log","http.log","ssh.log"],
+        "poll_interval": 0.5,
+    },
+    "ebpf": {
+        "enabled":        False,
+        "interface":      "wlan0",
+        "drop_threshold": 500,
+    },
+    "lgbm": {
+        "enabled":        True,
+        "model_path":     "models/lgbm_correlation.pkl",
+        "retrain_every":  500,
+        "min_train_rows": 50,
+        "risk_thresholds": {"MONITOR":0.3,"ALERT":0.55,"BLOCK_IP":0.75,"ISOLATE":0.90},
+    },
+    "wifi": {
+        "enabled":            True,
+        "deauth_threshold":    10,
+        "probe_threshold":     20,
+        "pmkid_detect":        True,
+        "evil_twin_detect":    True,
+        "channel_hop":         True,
+        "hop_interval":        0.3,
+        "channels":            list(range(1, 14)),
+    },
+    "port_scan": {
+        "enabled":            True,
+        "syn_threshold":      50,    # SYN vers ports distincts en 10s
+        "fin_udp_threshold":  30,
+        "time_window":        10,
+        "xmas_detect":        True,
+        "null_detect":        True,
+    },
+    "ssh_bruteforce": {
+        "enabled":            True,
+        "fail_threshold":     5,
+        "time_window":        60,
+        "track_successful":   True,
+    },
+    "http_anomaly": {
+        "enabled":       True,
+        "sqli_detect":   True,
+        "xss_detect":    True,
+        "path_traversal":True,
+        "rce_detect":    True,
+        "ua_anomaly":    True,
+        "method_anomaly":True,
+    },
+    "dns_tunnel": {
+        "enabled":          True,
+        "label_len_min":    45,
+        "entropy_min":      3.8,
+        "query_rate_max":   20,
+        "time_window":      10,
+        "txt_suspicious":   True,
+    },
+    "lateral_movement": {
+        "enabled":          True,
+        "scan_threshold":   5,
+        "time_window":      30,
+        "smb_detect":       True,
+        "rdp_detect":       True,
+        "internal_subnets": ["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"],
+    },
+    "data_exfil": {
+        "enabled":             True,
+        "outbound_limit_mb":   50,
+        "time_window":         300,
+        "compression_detect":  True,
+        "b64_detect":          True,
+        "staging_detect":      True,
+        "suspicious_ports":    [6666,7777,8888,9999,31337,4444,55555],
+    },
+    "pcap": {
+        "enabled":       True,
+        "auto_capture":  True,
+        "max_size_mb":   100,
+        "rotate_count":  10,
+        "min_severity":  "HIGH",
+    },
+    "playbook": {
+        "enabled":           True,
+        "auto_isolate":      False,
+        "notify_webhook":    "",
+        "notify_slack":      "",
+        "notify_email":      "",
+        "smtp_host":         "localhost",
+        "smtp_port":         25,
+        "escalate_critical": True,
+    },
+    "thresholds": {
+        "dns_beacon_interval_min": 5,
+        "dns_beacon_interval_max": 20,
+        "dns_beacon_min_samples":  5,
+        "high_entropy":            7.8,
+        "payload_size": {"80":8192,"443":16384,"default":4096},
+    },
+    "rl_agent": {
+        "enabled":        False,
+        "learning_rate":  0.05,
+        "epsilon":        0.15,
+        "epsilon_decay":  0.9995,
+        "epsilon_min":    0.01,
+        "reward_window":  120,
+        "features":       ["severity_score","confidence_score","alert_frequency",
+                           "distinct_alert_types","geo_risk","threat_intel_score"],
+        "actions":        ["allow","throttle","block","isolate","honeypot"],
+        "model_save_path":"output/rl_model.pkl",
+    },
+    "llm": {
+        "enabled":       False,
+        "api_key":       "",
+        "model":         "gpt-4o-mini",
+        "endpoint":      "https://api.openai.com/v1/chat/completions",
+        "max_tokens":    800,
+        "queue_size":    100,
+        "timeout":       30,
+        "min_severity":  "HIGH",
+        "prompt_template": (
+            "Tu es un analyste cybersécurité senior (CERT/SOC). Analyse cette alerte IDS:\n\n"
+            "{alert_json}\n\n"
+            "Réponds UNIQUEMENT en JSON valide (sans markdown) avec:\n"
+            "  explanation (str), mitigation (list[str]),\n"
+            "  yara_rule (str|null), kill_chain_phase (str),\n"
+            "  risk_score (1-10), false_positive_likelihood (low|medium|high),\n"
+            "  recommended_playbook (str)"
+        ),
+    },
+}
+
+
+def load_config(path="config/argus_config.yaml") -> Dict:
+    if not YAML_OK:
+        return deepcopy(DEFAULT_CONFIG)
+    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists():
+        with open(p, "w") as f:
+            yaml.dump(DEFAULT_CONFIG, f, default_flow_style=False, allow_unicode=True)
+    with open(p) as f:
+        user = yaml.safe_load(f) or {}
+    def _merge(base, ov):
+        r = deepcopy(base)
+        for k, v in ov.items():
+            r[k] = _merge(r[k], v) if isinstance(v, dict) and isinstance(r.get(k), dict) else v
+        return r
+    return _merge(DEFAULT_CONFIG, user)
+
+
+def setup_logging(level, out_dir) -> logging.Logger:
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    fmt = "%(asctime)s [%(name)-28s] %(levelname)-8s — %(message)s"
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO), format=fmt,
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(Path(out_dir)/"argus.log", encoding="utf-8"),
+        ]
+    )
+    return logging.getLogger("ARGUS")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 2 — GESTION INTERFACES KALI
+# ══════════════════════════════════════════════════════════════════════════════
+
+class KaliInterfaceManager:
+    def __init__(self, config: Dict):
+        self.cfg    = config.get("interfaces", {})
+        self.wlan0  = self.cfg.get("wlan0", "wlan0")
+        self.wlan1  = self.cfg.get("wlan1", "wlan1")
+        self.mon_if = self.cfg.get("monitor_iface", "wlan1mon")
+        self.log    = logging.getLogger("ARGUS.Iface")
+        self._mon_active = False
+        self._blocked_ips: Set[str] = set()
+        self._throttled:   Set[str] = set()
+
+    def check_interfaces(self) -> Dict[str, bool]:
+        result = {}
+        for iface in [self.wlan0, self.wlan1]:
+            path = Path(f"/sys/class/net/{iface}")
+            result[iface] = path.exists()
+            self.log.info("Interface %-10s : %s", iface, "✓ UP" if result[iface] else "✗ absent")
+        return result
+
+    def enable_monitor_mode(self) -> bool:
+        self.log.info("Activation mode monitor sur %s...", self.wlan1)
+        try:
+            subprocess.run(["sudo","airmon-ng","check","kill"], capture_output=True, timeout=10)
+            r = subprocess.run(["sudo","airmon-ng","start", self.wlan1],
+                               capture_output=True, text=True, timeout=15)
+            for line in r.stdout.splitlines():
+                if "mon" in line.lower() and "enabled" in line.lower():
+                    parts = line.split()
+                    for p in parts:
+                        if "mon" in p and p.startswith("wlan"):
+                            self.mon_if = p.strip("()[]"); break
+            if Path(f"/sys/class/net/{self.mon_if}").exists():
+                self.log.info("Mode monitor actif : %s", self.mon_if)
+                self._mon_active = True; return True
+            subprocess.run(["sudo","ip","link","set",self.wlan1,"down"], capture_output=True)
+            subprocess.run(["sudo","iw",self.wlan1,"set","monitor","none"], capture_output=True)
+            subprocess.run(["sudo","ip","link","set",self.wlan1,"name",self.mon_if], capture_output=True)
+            subprocess.run(["sudo","ip","link","set",self.mon_if,"up"], capture_output=True)
+            self._mon_active = True
+            self.log.info("Mode monitor actif via iw : %s", self.mon_if)
+            return True
+        except Exception as e:
+            self.log.error("Échec mode monitor : %s", e); return False
+
+    def disable_monitor_mode(self) -> None:
+        if not self._mon_active: return
+        try:
+            subprocess.run(["sudo","airmon-ng","stop", self.mon_if], capture_output=True, timeout=10)
+            self.log.info("Mode monitor désactivé")
+        except Exception as e:
+            self.log.warning("Désactivation monitor : %s", e)
+
+    def set_channel(self, channel: int, iface: Optional[str] = None) -> None:
+        iface = iface or self.mon_if
+        try:
+            subprocess.run(["sudo","iw","dev",iface,"set","channel",str(channel)],
+                           capture_output=True, timeout=3)
+        except Exception:
+            pass
+
+    def enable_ip_forwarding(self) -> None:
+        try:
+            subprocess.run(["sudo","sysctl","-w","net.ipv4.ip_forward=1"], capture_output=True)
+            self.log.info("IP forwarding activé")
+        except Exception as e:
+            self.log.warning("IP forward : %s", e)
+
+    def block_ip(self, ip: str, comment: str = "ARGUS") -> bool:
+        if not ip or ip in ("127.0.0.1","::1") or ip in self._blocked_ips:
+            return False
+        try:
+            for chain in ("INPUT", "FORWARD", "OUTPUT"):
+                subprocess.run([
+                    "sudo","iptables","-A",chain,"-s",ip,
+                    "-j","DROP","-m","comment","--comment",comment
+                ], capture_output=True)
+            self._blocked_ips.add(ip)
+            self.log.warning("🚫 IP BLOQUÉE [iptables] : %s (%s)", ip, comment)
+            return True
+        except Exception as e:
+            self.log.error("Blocage IP %s : %s", ip, e); return False
+
+    def unblock_ip(self, ip: str) -> bool:
+        if ip not in self._blocked_ips: return False
+        try:
+            for chain in ("INPUT", "FORWARD", "OUTPUT"):
+                subprocess.run([
+                    "sudo","iptables","-D",chain,"-s",ip,"-j","DROP"
+                ], capture_output=True)
+            self._blocked_ips.discard(ip)
+            self.log.info("✅ IP débloquée : %s", ip)
+            return True
+        except Exception as e:
+            self.log.error("Déblocage IP %s : %s", ip, e); return False
+
+    def throttle_ip(self, ip: str, kbps: int = 512) -> bool:
+        """Limite la bande passante d'une IP via tc (traffic control)."""
+        if ip in self._throttled: return False
+        try:
+            subprocess.run(["sudo","tc","qdisc","add","dev",self.wlan0,
+                "root","handle","1:","htb","default","12"], capture_output=True)
+            subprocess.run(["sudo","tc","class","add","dev",self.wlan0,
+                "parent","1:","classid","1:1","htb","rate",f"{kbps}kbit"], capture_output=True)
+            self._throttled.add(ip)
+            self.log.warning("⚡ IP throttlée : %s → %dkbps", ip, kbps)
+            return True
+        except Exception as e:
+            self.log.error("Throttle %s : %s", ip, e); return False
+
+    def deauth_station(self, bssid: str, station: str, count: int = 5) -> None:
+        if not self._mon_active: return
+        try:
+            subprocess.Popen([
+                "sudo","aireplay-ng","--deauth",str(count),
+                "-a",bssid,"-c",station,self.mon_if
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.log.warning("Déauth envoyé → %s depuis %s", station, bssid)
+        except Exception as e:
+            self.log.error("Déauth : %s", e)
+
+    def add_honeypot_rule(self, ip: str) -> None:
+        """Redirige l'IP vers un honeypot local (port 9999)."""
+        try:
+            subprocess.run([
+                "sudo","iptables","-t","nat","-A","PREROUTING",
+                "-s",ip,"-j","REDIRECT","--to-port","9999"
+            ], capture_output=True)
+            self.log.warning("🍯 IP redirigée vers honeypot : %s", ip)
+        except Exception as e:
+            self.log.error("Honeypot redirect : %s", e)
+
+    def get_connected_aps(self) -> List[Dict]:
+        try:
+            r = subprocess.run(["iw","dev",self.wlan0,"scan"],
+                               capture_output=True, text=True, timeout=10)
+            aps = []; current: Dict = {}
+            for line in r.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("BSS "):
+                    if current: aps.append(current)
+                    current = {"bssid": line.split()[1].split("(")[0]}
+                elif "SSID:" in line:
+                    current["ssid"] = line.split("SSID:")[1].strip()
+                elif "freq:" in line:
+                    current["freq"] = line.split("freq:")[1].strip()
+                elif "signal:" in line:
+                    current["signal"] = line.split("signal:")[1].strip()
+            if current: aps.append(current)
+            return aps
+        except Exception:
+            return []
+
+    @property
+    def blocked_ips(self) -> Set[str]:
+        return frozenset(self._blocked_ips)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 3 — DATACLASS ALERT (enrichie)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Alert:
+    type:           str
+    severity:       str                # CRITICAL | HIGH | MEDIUM | LOW
+    confidence:     str                # high | medium | low
+    detail:         str = ""
+    source_ip:      Optional[str] = None
+    dest_ip:        Optional[str] = None
+    domain:         Optional[str] = None
+    port:           Optional[int] = None
+    fingerprint:    Optional[str] = None
+    cve_id:         Optional[str] = None
+    subtype:        Optional[str] = None
+    entropy:        Optional[float] = None
+    payload_len:    Optional[int] = None
+    yara_rules:     List[str] = field(default_factory=list)
+    mitre_id:       str = "unknown"
+    mitre_tactic:   str = "unknown"
+    kill_chain:     str = "unknown"
+    timestamp:      float = field(default_factory=time.time)
+    action:         str = "allow"
+    brain:          Optional[Dict] = None
+    llm_analysis:   Optional[Dict] = None
+    lgbm_score:     Optional[float] = None
+    source:         str = "wlan0"
+    # Champs 802.11
+    bssid:          Optional[str] = None
+    ssid:           Optional[str] = None
+    channel:        Optional[int] = None
+    rssi:           Optional[int] = None
+    mac_src:        Optional[str] = None
+    mac_dst:        Optional[str] = None
+    # Champs enrichissement
+    geo_country:    Optional[str] = None
+    geo_city:       Optional[str] = None
+    geo_asn:        Optional[str] = None
+    geo_risk:       float = 0.0
+    threat_intel:   bool = False
+    ioc_match:      Optional[str] = None
+    # Champs réseau
+    proto:          Optional[str] = None
+    sport:          Optional[int] = None
+    dport:          Optional[int] = None
+    flags:          Optional[str] = None
+    http_method:    Optional[str] = None
+    http_uri:       Optional[str] = None
+    http_ua:        Optional[str] = None
+    http_code:      Optional[int] = None
+    # Champs scan
+    scanned_ports:  List[int] = field(default_factory=list)
+    scan_type:      Optional[str] = None
+    # Champs tunnel
+    dns_query_len:  Optional[int] = None
+    dns_type:       Optional[str] = None
+    # Data exfil
+    bytes_out:      Optional[int] = None
+    duration_s:     Optional[float] = None
+    # Lateral
+    target_hosts:   List[str] = field(default_factory=list)
+    # PCAP
+    pcap_file:      Optional[str] = None
+    raw_payload:    Optional[bytes] = field(default=None, repr=False)
+
+    def to_dict(self) -> Dict:
+        d = asdict(self)
+        d.pop("raw_payload", None)
+        d["timestamp_iso"] = datetime.utcfromtimestamp(d["timestamp"]).isoformat() + "Z"
+        return d
+
+    def serialize(self) -> str:
+        return json.dumps(self.to_dict())
+
+    @property
+    def risk_level(self) -> int:
+        m = {"CRITICAL":4,"HIGH":3,"MEDIUM":2,"LOW":1}
+        return m.get(self.severity, 1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — FAST MATH
+# ══════════════════════════════════════════════════════════════════════════════
+
+class FastMath:
+    @staticmethod
+    def entropy_bytes(data: bytes) -> float:
+        if CEXT_OK: return _cext.c_entropy_bytes(data)
+        if not data: return 0.0
+        return -sum(p * math.log2(p) for p in
+                    [data.count(b)/len(data) for b in set(data)] if p > 0)
+
+    @staticmethod
+    def entropy_str(s: str) -> float:
+        if CEXT_OK: return _cext.c_entropy_str(s)
+        if not s: return 0.0
+        return -sum(p * math.log2(p) for p in
+                    [s.count(c)/len(s) for c in set(s)] if p > 0)
+
+    @staticmethod
+    def consonant_ratio(s: str) -> float:
+        if CEXT_OK: return _cext.c_consonant_ratio(s)
+        alpha = [c for c in s.lower() if c.isalpha()]
+        return sum(1 for c in alpha if c not in "aeiou") / len(alpha) if alpha else 0.0
+
+    @staticmethod
+    def nop_sled(data: bytes, n: int = 16) -> bool:
+        if CEXT_OK: return bool(_cext.c_nop_sled(data, n))
+        count = 0
+        for b in data:
+            count = count + 1 if b == 0x90 else 0
+            if count >= n: return True
+        return False
+
+    @staticmethod
+    def parse_ja3(payload: bytes) -> Tuple:
+        if CEXT_OK: return _cext.c_parse_ja3_fields(payload)
+        try:
+            if len(payload) < 5 or payload[0] != 0x16: return None, None, None
+            ver = struct.unpack(">H", payload[1:3])[0]
+            off = 43
+            if off >= len(payload): return None, None, None
+            sl = payload[off]; off += 1 + sl
+            if off + 2 > len(payload): return None, None, None
+            cl = struct.unpack(">H", payload[off:off+2])[0]; off += 2
+            ciphers = [str(struct.unpack(">H", payload[off+i:off+i+2])[0])
+                       for i in range(0, cl, 2) if off+i+2 <= len(payload)]
+            off += cl
+            if off < len(payload): off += 1 + payload[off]
+            exts = []
+            if off + 2 <= len(payload):
+                et = struct.unpack(">H", payload[off:off+2])[0]; off += 2; end = off + et
+                while off + 4 <= end <= len(payload):
+                    etype = struct.unpack(">H", payload[off:off+2])[0]
+                    elen  = struct.unpack(">H", payload[off+2:off+4])[0]
+                    exts.append(str(etype)); off += 4 + elen
+            return str(ver), ",".join(ciphers), ",".join(exts)
+        except Exception:
+            return None, None, None
+
+    @staticmethod
+    def is_private_ip(ip: str) -> bool:
+        try:
+            return ipaddress.ip_address(ip).is_private
+        except Exception:
+            return False
+
+    @staticmethod
+    def ip_in_subnet(ip: str, subnets: List[str]) -> bool:
+        try:
+            addr = ipaddress.ip_address(ip)
+            return any(addr in ipaddress.ip_network(s, strict=False) for s in subnets)
+        except Exception:
+            return False
+
+    @staticmethod
+    def sliding_rate(ts_deque: deque, window_s: float) -> int:
+        now = time.time()
+        return sum(1 for t in ts_deque if now - t <= window_s)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5 — BASE DE DONNÉES
+# ══════════════════════════════════════════════════════════════════════════════
+
+if SA_OK:
+    Base = declarative_base()
+
+    class AlertRecord(Base):
+        __tablename__ = "alerts"
+        id            = Column(Integer, primary_key=True, autoincrement=True)
+        incident_id   = Column(String(32), unique=True, index=True)
+        timestamp     = Column(Float, nullable=False, index=True)
+        type          = Column(String(64), nullable=False, index=True)
+        subtype       = Column(String(64))
+        severity      = Column(String(16), nullable=False, index=True)
+        confidence    = Column(String(16))
+        source_ip     = Column(String(45), index=True)
+        dest_ip       = Column(String(45))
+        domain        = Column(String(255))
+        port          = Column(Integer)
+        fingerprint   = Column(String(64))
+        cve_id        = Column(String(32))
+        mitre_id      = Column(String(16))
+        mitre_tactic  = Column(String(64))
+        kill_chain    = Column(String(64))
+        risk_score    = Column(Float)
+        lgbm_score    = Column(Float)
+        action        = Column(String(16))
+        detail        = Column(Text)
+        llm_summary   = Column(Text)
+        raw_json      = Column(Text)
+        source        = Column(String(16), default="wlan0")
+        bssid         = Column(String(20))
+        ssid          = Column(String(64))
+        channel       = Column(Integer)
+        geo_country   = Column(String(64))
+        geo_city      = Column(String(64))
+        geo_risk      = Column(Float, default=0.0)
+        threat_intel  = Column(Boolean, default=False)
+        ioc_match     = Column(String(255))
+        proto         = Column(String(8))
+        http_method   = Column(String(16))
+        http_uri      = Column(Text)
+        bytes_out     = Column(Integer)
+        pcap_file     = Column(String(255))
+        __table_args__ = (
+            Index("idx_sev_ts",   "severity", "timestamp"),
+            Index("idx_ip_ts",    "source_ip", "timestamp"),
+            Index("idx_wifi",     "bssid", "timestamp"),
+            Index("idx_type_ts",  "type", "timestamp"),
+            Index("idx_country",  "geo_country"),
+        )
+
+    class IncidentCounter(Base):
+        __tablename__ = "incident_counter"
+        id    = Column(Integer, primary_key=True, default=1)
+        value = Column(Integer, default=0)
+
+    class BlockedIP(Base):
+        __tablename__ = "blocked_ips"
+        id         = Column(Integer, primary_key=True, autoincrement=True)
+        ip         = Column(String(45), unique=True, index=True)
+        reason     = Column(String(255))
+        blocked_at = Column(Float, default=time.time)
+        expires_at = Column(Float, nullable=True)
+        active     = Column(Boolean, default=True)
+
+    class ThreatIOC(Base):
+        __tablename__ = "threat_iocs"
+        id         = Column(Integer, primary_key=True, autoincrement=True)
+        ioc_type   = Column(String(32))   # ip | domain | hash | url
+        value      = Column(String(512), unique=True, index=True)
+        source     = Column(String(128))
+        severity   = Column(String(16), default="HIGH")
+        added_at   = Column(Float, default=time.time)
+
+
+class DatabaseManager:
+    def __init__(self, config: Dict):
+        self.log = logging.getLogger("ARGUS.DB")
+        self._counter = 0
+        if not SA_OK:
+            self.engine = self.SessionLocal = None; return
+        db_cfg = config.get("database", {})
+        url    = db_cfg.get("url", "sqlite:///output/argus.db")
+        Path("output").mkdir(exist_ok=True)
+        if url.startswith("sqlite"):
+            self.engine = create_engine(url, echo=db_cfg.get("echo", False),
+                connect_args={"check_same_thread": False}, poolclass=StaticPool)
+        else:
+            self.engine = create_engine(url, echo=db_cfg.get("echo", False),
+                pool_size=db_cfg.get("pool_size", 5), max_overflow=10)
+        Base.metadata.create_all(self.engine)
+        self.SessionLocal = sessionmaker(bind=self.engine)
+        if url.startswith("sqlite") and db_cfg.get("wal_mode", True):
+            with self.engine.connect() as conn:
+                conn.execute(text("PRAGMA journal_mode=WAL"))
+                conn.execute(text("PRAGMA synchronous=NORMAL"))
+                conn.execute(text("PRAGMA cache_size=-64000"))
+                conn.execute(text("PRAGMA temp_store=MEMORY"))
+                conn.commit()
+            self.log.info("SQLite WAL + optimisations activées")
+        with self.SessionLocal() as sess:
+            if not sess.get(IncidentCounter, 1):
+                sess.add(IncidentCounter(id=1, value=0)); sess.commit()
+        self._lock = threading.Lock()
+        self.log.info("DB prête : %s", url.split("///")[-1])
+
+    def next_incident_id(self) -> str:
+        if not SA_OK:
+            self._counter += 1
+            return f"INC-{self._counter:06d}"
+        with self._lock:
+            with self.SessionLocal() as sess:
+                c = sess.get(IncidentCounter, 1)
+                c.value += 1; val = c.value; sess.commit()
+        return f"INC-{val:06d}"
+
+    def insert_alert(self, alert: Alert, inc_id: str) -> None:
+        if not SA_OK: return
+        brain = alert.brain or {}
+        llm_s = None
+        if alert.llm_analysis:
+            llm_s = json.dumps({
+                "risk_score": alert.llm_analysis.get("risk_score"),
+                "fp":         alert.llm_analysis.get("false_positive_likelihood"),
+                "kill_chain": alert.llm_analysis.get("kill_chain_phase","?"),
+                "playbook":   alert.llm_analysis.get("recommended_playbook","?"),
+                "expl":       str(alert.llm_analysis.get("explanation",""))[:500],
+            })
+        rec = AlertRecord(
+            incident_id=inc_id, timestamp=alert.timestamp,
+            type=alert.type, subtype=alert.subtype,
+            severity=alert.severity, confidence=alert.confidence,
+            source_ip=alert.source_ip, dest_ip=alert.dest_ip,
+            domain=alert.domain, port=alert.port,
+            fingerprint=alert.fingerprint, cve_id=alert.cve_id,
+            mitre_id=alert.mitre_id, mitre_tactic=alert.mitre_tactic,
+            kill_chain=alert.kill_chain,
+            risk_score=brain.get("risk_score"), lgbm_score=alert.lgbm_score,
+            action=alert.action, detail=str(alert.detail)[:1000],
+            llm_summary=llm_s, raw_json=alert.serialize()[:8000],
+            source=alert.source, bssid=alert.bssid,
+            ssid=alert.ssid, channel=alert.channel,
+            geo_country=alert.geo_country, geo_city=alert.geo_city,
+            geo_risk=alert.geo_risk,
+            threat_intel=alert.threat_intel, ioc_match=alert.ioc_match,
+            proto=alert.proto, http_method=alert.http_method,
+            http_uri=str(alert.http_uri or "")[:512],
+            bytes_out=alert.bytes_out, pcap_file=alert.pcap_file,
+        )
+        try:
+            with self._lock:
+                with self.SessionLocal() as sess:
+                    sess.merge(rec); sess.commit()
+        except Exception as e:
+            self.log.error("DB insert : %s", e)
+
+    def add_blocked_ip(self, ip: str, reason: str, expires_h: Optional[int] = None) -> None:
+        if not SA_OK: return
+        exp = time.time() + expires_h * 3600 if expires_h else None
+        try:
+            with self._lock:
+                with self.SessionLocal() as sess:
+                    existing = sess.query(BlockedIP).filter_by(ip=ip).first()
+                    if existing:
+                        existing.active = True; existing.reason = reason; existing.expires_at = exp
+                    else:
+                        sess.add(BlockedIP(ip=ip, reason=reason, expires_at=exp))
+                    sess.commit()
+        except Exception as e:
+            self.log.error("BlockedIP insert : %s", e)
+
+    def get_active_blocks(self) -> List[Dict]:
+        if not SA_OK: return []
+        now = time.time()
+        try:
+            with self.SessionLocal() as sess:
+                rows = sess.query(BlockedIP).filter(
+                    BlockedIP.active == True,
+                ).all()
+                return [{"ip":r.ip,"reason":r.reason,
+                         "blocked_at":r.blocked_at,"expires_at":r.expires_at}
+                        for r in rows if not r.expires_at or r.expires_at > now]
+        except Exception:
+            return []
+
+    def export_training_data(self, limit=50000):
+        if not (SA_OK and NP_OK): return None
+        SEV = {"LOW":1,"MEDIUM":2,"HIGH":3,"CRITICAL":4}
+        CON = {"low":1,"medium":2,"high":3}
+        try:
+            with self.SessionLocal() as sess:
+                rows = sess.query(AlertRecord).filter(
+                    AlertRecord.risk_score.isnot(None)
+                ).order_by(AlertRecord.timestamp.desc()).limit(limit).all()
+            if len(rows) < 10: return None
+            X, y = [], []
+            for r in rows:
+                ts  = datetime.utcfromtimestamp(r.timestamp)
+                tod = ts.hour + ts.minute/60.0
+                X.append([
+                    SEV.get(r.severity or "LOW",1),
+                    CON.get(r.confidence or "low",1),
+                    0, 0, 0, r.port or 0,
+                    math.sin(2*math.pi*tod/24), math.cos(2*math.pi*tod/24),
+                    r.geo_risk or 0.0,
+                    1.0 if r.threat_intel else 0.0,
+                    0.0, 0.0,
+                ])
+                y.append(min(1.0,(r.risk_score or 0)/10.0))
+            return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
+        except Exception as e:
+            self.log.error("Export training : %s", e); return None
+
+    def recent_stats(self) -> Dict:
+        if not SA_OK: return {}
+        since = time.time() - 86400
+        try:
+            with self.SessionLocal() as sess:
+                rows = sess.query(
+                    AlertRecord.severity, AlertRecord.type,
+                    AlertRecord.source, AlertRecord.geo_country,
+                    AlertRecord.threat_intel
+                ).filter(AlertRecord.timestamp >= since).all()
+            sev, types, sources, geo, ti = (defaultdict(int) for _ in range(5))
+            for r in rows:
+                sev[r.severity]+=1; types[r.type]+=1
+                sources[r.source or "?"]+=1
+                if r.geo_country: geo[r.geo_country]+=1
+                if r.threat_intel: ti["confirmed"]+=1
+            return {
+                "by_severity":dict(sev), "by_type":dict(types),
+                "by_source":dict(sources), "by_country":dict(geo),
+                "threat_intel_hits":dict(ti), "total":len(rows),
+            }
+        except Exception as e:
+            self.log.error("Stats : %s", e); return {}
+
+    def get_top_attackers(self, limit=20) -> List[Dict]:
+        if not SA_OK: return []
+        since = time.time() - 86400
+        try:
+            with self.SessionLocal() as sess:
+                from sqlalchemy import func as sfunc
+                rows = sess.query(
+                    AlertRecord.source_ip,
+                    sfunc.count(AlertRecord.id).label("cnt"),
+                    sfunc.max(AlertRecord.risk_score).label("max_risk"),
+                    AlertRecord.geo_country,
+                ).filter(
+                    AlertRecord.timestamp >= since,
+                    AlertRecord.source_ip.isnot(None)
+                ).group_by(AlertRecord.source_ip).order_by(
+                    sfunc.count(AlertRecord.id).desc()
+                ).limit(limit).all()
+                return [{"ip":r.source_ip,"count":r.cnt,
+                         "max_risk":r.max_risk,"country":r.geo_country}
+                        for r in rows]
+        except Exception:
+            return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6 — THREAT INTELLIGENCE
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ThreatIntelligence:
+    """
+    Gestion des IOC (Indicators of Compromise) :
+    - IPs malveillantes (feeds externes + fichier local)
+    - Domaines C2 connus
+    - Hash de fichiers malveillants
+    - Mise à jour automatique des feeds
+    """
+    HIGH_RISK_COUNTRIES = frozenset({
+        "CN","RU","KP","IR","SY","CU","SD","MM","BY","VE"
+    })
+    MEDIUM_RISK_COUNTRIES = frozenset({
+        "NG","UA","RO","BR","IN","PK","BD"
+    })
+
+    def __init__(self, config: Dict, db: "DatabaseManager"):
+        self.cfg        = config.get("threat_intel", {})
+        self.db         = db
+        self.enabled    = self.cfg.get("enabled", True)
+        self.log        = logging.getLogger("ARGUS.ThreatIntel")
+        self._bad_ips:  Set[str] = set()
+        self._bad_doms: Set[str] = set()
+        self._bad_hash: Set[str] = set()
+        self._lock      = threading.Lock()
+        self._load_local()
+        if self.enabled:
+            threading.Thread(target=self._auto_refresh,
+                             daemon=True, name="TI-Refresh").start()
+
+    def _load_local(self) -> None:
+        f = Path(self.cfg.get("local_ioc_file","data/ioc_list.txt"))
+        if not f.exists():
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text("# ARGUS IOC List — format: type:value\n# ip:1.2.3.4\n# domain:evil.com\n# hash:abc123\n")
+            return
+        count = 0
+        for line in f.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"): continue
+            if ":" in line:
+                t, v = line.split(":", 1)
+                v = v.strip().lower()
+                if t == "ip":     self._bad_ips.add(v); count+=1
+                elif t == "domain": self._bad_doms.add(v); count+=1
+                elif t == "hash": self._bad_hash.add(v); count+=1
+            else:
+                # Assume IP si format valide
+                try:
+                    ipaddress.ip_address(line); self._bad_ips.add(line); count+=1
+                except ValueError:
+                    self._bad_doms.add(line.lower()); count+=1
+        self.log.info("IOC locaux : %d entrées (%d IP, %d domaines, %d hash)",
+                      count, len(self._bad_ips), len(self._bad_doms), len(self._bad_hash))
+
+    def _fetch_feed(self, url: str) -> Set[str]:
+        if not REQUESTS_OK: return set()
+        ips: Set[str] = set()
+        try:
+            r = http_req.get(url, timeout=15, headers={"User-Agent":"ARGUS-IDS/9.0"})
+            if r.status_code != 200: return ips
+            for line in r.text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"): continue
+                try:
+                    ipaddress.ip_address(line); ips.add(line)
+                except ValueError:
+                    pass
+            self.log.info("Feed '%s' : %d IPs", url[:60], len(ips))
+        except Exception as e:
+            self.log.warning("Feed %s : %s", url[:60], e)
+        return ips
+
+    def _auto_refresh(self) -> None:
+        interval = self.cfg.get("refresh_hours", 6) * 3600
+        while True:
+            time.sleep(60)  # Premier refresh après 1 min
+            feeds = self.cfg.get("feeds", [])
+            new_ips: Set[str] = set()
+            for url in feeds:
+                new_ips |= self._fetch_feed(url)
+            if new_ips:
+                with self._lock:
+                    self._bad_ips |= new_ips
+                self.log.info("ThreatIntel mis à jour : +%d IPs", len(new_ips))
+            time.sleep(interval - 60)
+
+    def check_ip(self, ip: str) -> Tuple[bool, float, str]:
+        """Retourne (is_malicious, geo_risk_score, source)"""
+        if not ip: return False, 0.0, ""
+        with self._lock:
+            if ip in self._bad_ips:
+                return True, 1.0, "ioc_feed"
+        # GeoIP risk
+        return False, 0.0, ""
+
+    def check_domain(self, domain: str) -> Tuple[bool, str]:
+        if not domain: return False, ""
+        dom_lower = domain.lower()
+        with self._lock:
+            for bad in self._bad_doms:
+                if dom_lower == bad or dom_lower.endswith("." + bad):
+                    return True, bad
+        return False, ""
+
+    def check_hash(self, h: str) -> bool:
+        with self._lock:
+            return h.lower() in self._bad_hash
+
+    def add_ioc(self, ioc_type: str, value: str, source: str = "manual") -> None:
+        v = value.lower()
+        with self._lock:
+            if ioc_type == "ip":     self._bad_ips.add(v)
+            elif ioc_type == "domain": self._bad_doms.add(v)
+            elif ioc_type == "hash": self._bad_hash.add(v)
+        if SA_OK and self.db.SessionLocal:
+            try:
+                with self.db._lock:
+                    with self.db.SessionLocal() as sess:
+                        existing = sess.query(ThreatIOC).filter_by(value=v).first()
+                        if not existing:
+                            sess.add(ThreatIOC(ioc_type=ioc_type, value=v, source=source))
+                            sess.commit()
+            except Exception:
+                pass
+
+    @property
+    def stats(self) -> Dict:
+        with self._lock:
+            return {"bad_ips":len(self._bad_ips),"bad_domains":len(self._bad_doms),
+                    "bad_hashes":len(self._bad_hash)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 7 — GEOIP RESOLVER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GeoIPResolver:
+    HIGH_RISK = frozenset({"CN","RU","KP","IR","SY","CU","SD","MM","BY","VE","AF"})
+    MEDIUM_RISK = frozenset({"NG","UA","RO","BR","IN","PK","BD","LY","YE","SO"})
+
+    def __init__(self, db_path: str = "data/GeoLite2-City.mmdb"):
+        self.log    = logging.getLogger("ARGUS.GeoIP")
+        self._db    = None
+        self._cache: Dict[str, Dict] = {}
+        if GEOIP_OK and Path(db_path).exists():
+            try:
+                self._db = geoip2.database.Reader(db_path)
+                self.log.info("GeoIP DB chargée : %s", db_path)
+            except Exception as e:
+                self.log.warning("GeoIP : %s", e)
+        else:
+            self.log.info("GeoIP non disponible (installez geoip2 + GeoLite2-City.mmdb)")
+
+    def lookup(self, ip: str) -> Dict:
+        if not ip or FastMath.is_private_ip(ip):
+            return {"country":"LOCAL","city":"","asn":"","risk":0.0}
+        if ip in self._cache:
+            return self._cache[ip]
+        result = {"country":"","city":"","asn":"","risk":0.0}
+        if self._db:
+            try:
+                r = self._db.city(ip)
+                c = r.country.iso_code or ""
+                result["country"] = c
+                result["city"]    = r.city.name or ""
+                result["risk"]    = (1.0 if c in self.HIGH_RISK else
+                                     0.5 if c in self.MEDIUM_RISK else 0.1)
+            except Exception:
+                pass
+        self._cache[ip] = result
+        if len(self._cache) > 50000:
+            # LRU simple : supprimer la moitié
+            keys = list(self._cache.keys())
+            for k in keys[:25000]:
+                del self._cache[k]
+        return result
+
+    def risk_score(self, ip: str) -> float:
+        return self.lookup(ip).get("risk", 0.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 8 — MITRE ATT&CK MAPPER (étendu)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MitreMapper:
+    MAP = {
+        "dns_beaconing":        {"id":"T1071.004","tactic":"Command and Control",  "kill_chain":"C2"},
+        "tls_anomaly":          {"id":"T1041",    "tactic":"Exfiltration",          "kill_chain":"Actions on Objectives"},
+        "dga_domain":           {"id":"T1568.002","tactic":"Command and Control",  "kill_chain":"C2"},
+        "yara_match":           {"id":"T1027",    "tactic":"Defense Evasion",       "kill_chain":"Installation"},
+        "buffer_overflow":      {"id":"T1499.002","tactic":"Impact",               "kill_chain":"Exploitation"},
+        "backdoor_behavior":    {"id":"T1071",    "tactic":"Command and Control",  "kill_chain":"C2"},
+        "cve_exploit":          {"id":"T1190",    "tactic":"Initial Access",        "kill_chain":"Exploitation"},
+        "port_scan":            {"id":"T1046",    "tactic":"Discovery",             "kill_chain":"Reconnaissance"},
+        "data_exfiltration":    {"id":"T1048",    "tactic":"Exfiltration",          "kill_chain":"Actions on Objectives"},
+        "arp_spoofing":         {"id":"T1557.002","tactic":"Credential Access",    "kill_chain":"Exploitation"},
+        "wifi_deauth":          {"id":"T1499",    "tactic":"Impact",               "kill_chain":"Actions on Objectives"},
+        "wifi_evil_twin":       {"id":"T1557",    "tactic":"Collection",           "kill_chain":"Exploitation"},
+        "wifi_pmkid":           {"id":"T1110",    "tactic":"Credential Access",    "kill_chain":"Exploitation"},
+        "wifi_probe":           {"id":"T1040",    "tactic":"Discovery",             "kill_chain":"Reconnaissance"},
+        "wifi_handshake":       {"id":"T1110.003","tactic":"Credential Access",    "kill_chain":"Exploitation"},
+        "zeek_weird":           {"id":"T1040",    "tactic":"Discovery",             "kill_chain":"Reconnaissance"},
+        "zeek_file":            {"id":"T1105",    "tactic":"Command and Control",  "kill_chain":"Delivery"},
+        "ssh_bruteforce":       {"id":"T1110.001","tactic":"Credential Access",    "kill_chain":"Exploitation"},
+        "http_sqli":            {"id":"T1190",    "tactic":"Initial Access",        "kill_chain":"Exploitation"},
+        "http_xss":             {"id":"T1059.007","tactic":"Execution",            "kill_chain":"Exploitation"},
+        "http_path_traversal":  {"id":"T1083",    "tactic":"Discovery",             "kill_chain":"Reconnaissance"},
+        "http_rce":             {"id":"T1059",    "tactic":"Execution",            "kill_chain":"Exploitation"},
+        "dns_tunnel":           {"id":"T1071.004","tactic":"Command and Control",  "kill_chain":"C2"},
+        "lateral_movement":     {"id":"T1021",    "tactic":"Lateral Movement",     "kill_chain":"Lateral Movement"},
+        "data_exfil":           {"id":"T1048.003","tactic":"Exfiltration",         "kill_chain":"Actions on Objectives"},
+        "threat_intel_hit":     {"id":"T1071",    "tactic":"Command and Control",  "kill_chain":"C2"},
+        "icmp_flood":           {"id":"T1498.001","tactic":"Impact",               "kill_chain":"Actions on Objectives"},
+        "credential_harvest":   {"id":"T1003",    "tactic":"Credential Access",    "kill_chain":"Exploitation"},
+    }
+
+    def map(self, t: str) -> Dict:
+        return self.MAP.get(t.lower(), {"id":"unknown","tactic":"unknown","kill_chain":"unknown"})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 9 — PORT SCAN DETECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PortScanDetector:
+    """
+    Détecte :
+    - SYN Scan (half-open) : beaucoup de SYN sans ACK
+    - FIN/NULL/XMAS Scan : flags anormaux
+    - UDP Scan : flood UDP vers ports variés
+    - Service Scan : connexions vers ports sensibles connus
+    - Vertical scan (même IP, beaucoup de ports)
+    - Horizontal scan (même port, beaucoup d'IPs — Nmap -p 22 192.168.0.0/24)
+    """
+    SENSITIVE_PORTS = frozenset({
+        21,22,23,25,53,80,110,111,135,137,139,143,161,389,
+        443,445,512,513,514,873,993,995,1080,1433,1521,
+        2049,3306,3389,5432,5900,6379,8080,8443,27017
+    })
+
+    def __init__(self, config: Dict):
+        cfg = config.get("port_scan", {})
+        self.enabled         = cfg.get("enabled", True)
+        self.syn_thresh      = cfg.get("syn_threshold", 50)
+        self.fin_thresh      = cfg.get("fin_udp_threshold", 30)
+        self.win             = cfg.get("time_window", 10)
+        self.xmas_detect     = cfg.get("xmas_detect", True)
+        self.null_detect     = cfg.get("null_detect", True)
+        self.log             = logging.getLogger("ARGUS.PortScan")
+        # {src_ip: {dst_ip: set(ports)}}
+        self._syn:  Dict[str, Dict[str, deque]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=2000)))
+        self._udp:  Dict[str, deque] = defaultdict(lambda: deque(maxlen=2000))
+        self._horiz:Dict[str, deque] = defaultdict(lambda: deque(maxlen=2000))   # port → [src_ips]
+        self._ports:Dict[str, Set[int]] = defaultdict(set)  # src → {ports}
+        self._ts:   Dict[str, deque]  = defaultdict(lambda: deque(maxlen=2000))
+        self._lock  = threading.Lock()
+
+    def analyze(self, pkt) -> List[Alert]:
+        if not (self.enabled and SCAPY_OK): return []
+        if not pkt.haslayer(IP): return []
+        alerts: List[Alert] = []
+        src = pkt[IP].src; dst = pkt[IP].dst
+        now = time.time()
+
+        # ── ICMP flood ────────────────────────────────────────────────────
+        if pkt.haslayer(ICMP):
+            with self._lock:
+                self._ts[src].append(now)
+                rate = FastMath.sliding_rate(self._ts[src], 5)
+            if rate > 100:
+                alerts.append(Alert(
+                    type="icmp_flood", severity="MEDIUM", confidence="high",
+                    source_ip=src, dest_ip=dst,
+                    detail=f"ICMP flood : {rate} paquets/5s depuis {src}",
+                ))
+
+        # ── TCP ───────────────────────────────────────────────────────────
+        if pkt.haslayer(TCP):
+            tcp = pkt[TCP]
+            flags = tcp.flags
+            dport = tcp.dport; sport = tcp.sport
+
+            # XMAS Scan (FIN+PSH+URG)
+            if self.xmas_detect and flags & 0x29 == 0x29:
+                alerts.append(Alert(
+                    type="port_scan", subtype="xmas_scan",
+                    severity="HIGH", confidence="high",
+                    source_ip=src, dest_ip=dst, port=dport,
+                    detail=f"XMAS scan depuis {src} → {dst}:{dport}",
+                ))
+
+            # NULL Scan (aucun flag)
+            if self.null_detect and int(flags) == 0:
+                alerts.append(Alert(
+                    type="port_scan", subtype="null_scan",
+                    severity="HIGH", confidence="high",
+                    source_ip=src, dest_ip=dst, port=dport,
+                    detail=f"NULL scan depuis {src} → {dst}:{dport}",
+                ))
+
+            # SYN Scan
+            if flags & 0x02 and not (flags & 0x10):  # SYN sans ACK
+                with self._lock:
+                    self._syn[src][dst].append((now, dport))
+                    self._ports[src].add(dport)
+                    recent_ports = {p for t,p in self._syn[src][dst] if now-t <= self.win}
+                if len(recent_ports) >= self.syn_thresh:
+                    alerts.append(Alert(
+                        type="port_scan", subtype="syn_scan",
+                        severity="HIGH", confidence="high",
+                        source_ip=src, dest_ip=dst,
+                        scanned_ports=sorted(list(recent_ports))[:50],
+                        detail=f"SYN scan : {len(recent_ports)} ports en {self.win}s depuis {src}",
+                    ))
+
+            # Accès à port sensible
+            if dport in self.SENSITIVE_PORTS and flags & 0x02:
+                alerts.append(Alert(
+                    type="port_scan", subtype="sensitive_port",
+                    severity="LOW", confidence="medium",
+                    source_ip=src, dest_ip=dst, port=dport,
+                    detail=f"Connexion vers port sensible {dport} depuis {src}",
+                ))
+
+        # ── UDP Scan ──────────────────────────────────────────────────────
+        if pkt.haslayer(UDP):
+            dport = pkt[UDP].dport
+            with self._lock:
+                self._udp[src].append((now, dport))
+                recent_ports = {p for t,p in self._udp[src] if now-t <= self.win}
+            if len(recent_ports) >= self.fin_thresh:
+                alerts.append(Alert(
+                    type="port_scan", subtype="udp_scan",
+                    severity="MEDIUM", confidence="medium",
+                    source_ip=src, dest_ip=dst,
+                    scanned_ports=sorted(list(recent_ports))[:50],
+                    detail=f"UDP scan : {len(recent_ports)} ports en {self.win}s depuis {src}",
+                ))
+
+        return alerts
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 10 — SSH BRUTE FORCE DETECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SSHBruteForceDetector:
+    """
+    Détecte les attaques brute-force SSH via :
+    - Comptage des connexions TCP/22 par IP source
+    - Analyse des banners SSH (version fingerprinting)
+    - Détection des patterns Hydra/Medusa/Metasploit
+    """
+    SSH_TOOLS_PATTERNS = [
+        b"SSH-2.0-libssh",
+        b"SSH-2.0-JSCH",
+        b"SSH-2.0-paramiko",
+        b"SSH-2.0-Go",
+        b"SSH-2.0-OpenSSH_for_Windows",
+    ]
+    KALI_TOOLS = [b"Hydra", b"Medusa", b"ncrack", b"patator"]
+
+    def __init__(self, config: Dict):
+        cfg              = config.get("ssh_bruteforce", {})
+        self.enabled     = cfg.get("enabled", True)
+        self.thresh      = cfg.get("fail_threshold", 5)
+        self.win         = cfg.get("time_window", 60)
+        self.log         = logging.getLogger("ARGUS.SSH")
+        self._attempts:  Dict[str, deque] = defaultdict(lambda: deque(maxlen=500))
+        self._success:   Dict[str, deque] = defaultdict(lambda: deque(maxlen=100))
+        self._banners:   Dict[str, str]   = {}
+
+    def analyze(self, pkt) -> List[Alert]:
+        if not (self.enabled and SCAPY_OK): return []
+        if not (pkt.haslayer(IP) and pkt.haslayer(TCP)): return []
+        alerts: List[Alert] = []
+        tcp = pkt[TCP]; src = pkt[IP].src; dst = pkt[IP].dst
+        now = time.time()
+
+        # Port 22 connexions entrantes
+        if tcp.dport == 22 and tcp.flags & 0x02:
+            self._attempts[src].append(now)
+            count = FastMath.sliding_rate(self._attempts[src], self.win)
+            if count >= self.thresh:
+                alerts.append(Alert(
+                    type="ssh_bruteforce", severity="HIGH", confidence="high",
+                    source_ip=src, dest_ip=dst, port=22,
+                    detail=f"SSH brute-force : {count} tentatives en {self.win}s depuis {src}",
+                ))
+
+        # Analyse du banner SSH
+        if pkt.haslayer(Raw) and (tcp.dport == 22 or tcp.sport == 22):
+            payload = bytes(pkt[Raw].load)
+            if payload.startswith(b"SSH-"):
+                banner = payload[:64].decode(errors="replace").strip()
+                self._banners[src] = banner
+                for pat in self.SSH_TOOLS_PATTERNS:
+                    if pat in payload:
+                        alerts.append(Alert(
+                            type="ssh_bruteforce", subtype="tool_fingerprint",
+                            severity="MEDIUM", confidence="medium",
+                            source_ip=src, dest_ip=dst, port=22,
+                            detail=f"Tool SSH détecté : {banner[:60]}",
+                        ))
+                        break
+                for pat in self.KALI_TOOLS:
+                    if pat.lower() in payload.lower():
+                        alerts.append(Alert(
+                            type="ssh_bruteforce", subtype="kali_tool",
+                            severity="CRITICAL", confidence="high",
+                            source_ip=src, dest_ip=dst, port=22,
+                            detail=f"Outil de crack SSH Kali détecté : {pat.decode()}",
+                        ))
+
+        return alerts
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 11 — HTTP ANOMALY DETECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class HTTPAnomalyDetector:
+    """
+    Détecte les attaques HTTP :
+    - SQL Injection (SQLi)
+    - Cross-Site Scripting (XSS)
+    - Path Traversal / LFI / RFI
+    - Remote Code Execution (RCE)
+    - User-Agent anormaux (scanners : Nikto, sqlmap, Burp)
+    - Méthodes HTTP anormales
+    - Fuzzing / Dirbuster patterns
+    """
+    SQLI_PATTERNS = [
+        rb"(?:union\s+select|select\s+.*\s+from|insert\s+into|drop\s+table)",
+        rb"(?:or\s+1\s*=\s*1|and\s+1\s*=\s*1|'\s*or\s*'1'\s*=\s*'1)",
+        rb"(?:exec\s*\(|execute\s*\(|sp_executesql)",
+        rb"(?:xp_cmdshell|benchmark\s*\(|sleep\s*\()",
+        rb"(?:information_schema|sys\.tables|pg_sleep)",
+        rb"(?:;\s*drop|;\s*truncate|;\s*delete\s+from)",
+    ]
+    XSS_PATTERNS = [
+        rb"<script[^>]*>",
+        rb"javascript\s*:",
+        rb"(?:onerror|onload|onmouseover|onfocus)\s*=",
+        rb"(?:eval\s*\(|document\.cookie|document\.write)",
+        rb"(?:<iframe|<object|<embed|<svg\s+on)",
+        rb"(?:alert\s*\(|confirm\s*\(|prompt\s*\()",
+    ]
+    PATH_TRAVERSAL = [
+        rb"(?:\.\.[\\/]){2,}",
+        rb"(?:%2e%2e[\\/]|%2f|%5c){2,}",
+        rb"(?:/etc/passwd|/etc/shadow|/proc/self)",
+        rb"(?:win\.ini|system32|cmd\.exe)",
+        rb"(?:php://filter|php://input|file://)",
+        rb"(?:data://text|zip://|expect://)",
+    ]
+    RCE_PATTERNS = [
+        rb"(?:;ls |;cat |;id;|;pwd;|`ls`|`id`|\$\(id\))",
+        rb"(?:system\s*\(|passthru\s*\(|shell_exec\s*\(|exec\s*\()",
+        rb"(?:\|\|wget\s|\|\|curl\s|;wget\s|;curl\s)",
+        rb"(?:python\s+-c|perl\s+-e|ruby\s+-e|php\s+-r)",
+        rb"(?:base64\s+-d\s|bash\s+-i|sh\s+-i)",
+    ]
+    BAD_UAS = [
+        "nikto", "sqlmap", "masscan", "nmap scripting",
+        "burpsuite", "havij", "acunetix", "w3af", "dirbuster",
+        "gobuster", "ffuf", "wfuzz", "nuclei", "metasploit",
+        "python-requests/2.", "zgrab", "zgrab2",
+    ]
+    DANGEROUS_METHODS = frozenset({"TRACE","TRACK","CONNECT","PROPFIND","PROPPATCH","MKCOL"})
+
+    def __init__(self, config: Dict):
+        cfg            = config.get("http_anomaly", {})
+        self.enabled   = cfg.get("enabled", True)
+        self.sqli      = cfg.get("sqli_detect", True)
+        self.xss       = cfg.get("xss_detect", True)
+        self.traversal = cfg.get("path_traversal", True)
+        self.rce       = cfg.get("rce_detect", True)
+        self.ua_check  = cfg.get("ua_anomaly", True)
+        self.meth      = cfg.get("method_anomaly", True)
+        self.log       = logging.getLogger("ARGUS.HTTP")
+        self._sqli_re  = [re.compile(p, re.I) for p in self.SQLI_PATTERNS]
+        self._xss_re   = [re.compile(p, re.I) for p in self.XSS_PATTERNS]
+        self._pt_re    = [re.compile(p, re.I) for p in self.PATH_TRAVERSAL]
+        self._rce_re   = [re.compile(p, re.I) for p in self.RCE_PATTERNS]
+
+    def analyze(self, pkt) -> List[Alert]:
+        if not (self.enabled and SCAPY_OK): return []
+        if not (pkt.haslayer(IP) and pkt.haslayer(TCP) and pkt.haslayer(Raw)): return []
+        tcp = pkt[TCP]
+        if tcp.dport not in (80, 8080, 8000, 8888, 443, 8443): return []
+        alerts: List[Alert] = []
+        src = pkt[IP].src; dst = pkt[IP].dst
+        try:
+            payload = bytes(pkt[Raw].load)
+            decoded = unquote(payload.decode(errors="replace"))
+        except Exception:
+            return alerts
+
+        # Parse HTTP request line
+        method = uri = ua = ""
+        lines = decoded.split("\r\n")
+        if lines:
+            parts = lines[0].split(" ")
+            if len(parts) >= 2:
+                method = parts[0].upper(); uri = parts[1]
+        for line in lines:
+            if line.lower().startswith("user-agent:"):
+                ua = line.split(":",1)[1].strip().lower()
+
+        # Méthode dangereuse
+        if self.meth and method in self.DANGEROUS_METHODS:
+            alerts.append(Alert(
+                type="http_rce", subtype="dangerous_method",
+                severity="MEDIUM", confidence="high",
+                source_ip=src, dest_ip=dst, port=tcp.dport,
+                http_method=method, http_uri=uri[:256],
+                detail=f"Méthode HTTP dangereuse : {method} {uri[:60]}",
+            ))
+
+        # User-Agent malveillant
+        if self.ua_check and ua:
+            for bad in self.BAD_UAS:
+                if bad in ua:
+                    alerts.append(Alert(
+                        type="port_scan", subtype="http_scanner",
+                        severity="MEDIUM", confidence="high",
+                        source_ip=src, dest_ip=dst, port=tcp.dport,
+                        http_method=method, http_ua=ua[:128],
+                        detail=f"Scanner HTTP détecté : UA='{ua[:60]}'",
+                    ))
+                    break
+
+        payload_lower = payload.lower()
+
+        # SQLi
+        if self.sqli:
+            for r in self._sqli_re:
+                if r.search(payload_lower):
+                    alerts.append(Alert(
+                        type="http_sqli", severity="CRITICAL", confidence="high",
+                        source_ip=src, dest_ip=dst, port=tcp.dport,
+                        http_method=method, http_uri=uri[:256],
+                        detail=f"SQL Injection détectée : {uri[:80]}",
+                    ))
+                    break
+
+        # XSS
+        if self.xss:
+            for r in self._xss_re:
+                if r.search(payload_lower):
+                    alerts.append(Alert(
+                        type="http_xss", severity="HIGH", confidence="high",
+                        source_ip=src, dest_ip=dst, port=tcp.dport,
+                        http_method=method, http_uri=uri[:256],
+                        detail=f"XSS détecté dans la requête : {uri[:80]}",
+                    ))
+                    break
+
+        # Path Traversal
+        if self.traversal:
+            for r in self._pt_re:
+                if r.search(payload_lower):
+                    alerts.append(Alert(
+                        type="http_path_traversal", severity="HIGH", confidence="high",
+                        source_ip=src, dest_ip=dst, port=tcp.dport,
+                        http_method=method, http_uri=uri[:256],
+                        detail=f"Path Traversal / LFI détecté : {uri[:80]}",
+                    ))
+                    break
+
+        # RCE
+        if self.rce:
+            for r in self._rce_re:
+                if r.search(payload_lower):
+                    alerts.append(Alert(
+                        type="http_rce", subtype="command_injection",
+                        severity="CRITICAL", confidence="high",
+                        source_ip=src, dest_ip=dst, port=tcp.dport,
+                        http_method=method, http_uri=uri[:256],
+                        detail=f"RCE / Command Injection détectée : {uri[:80]}",
+                    ))
+                    break
+
+        return alerts
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 12 — DNS TUNNELING DETECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DNSTunnelingDetector:
+    """
+    Détecte la tunnelisation DNS (ex: iodine, dns2tcp, dnscat2) via :
+    - Longueur anormale des labels (>45 chars)
+    - Haute entropie des requêtes
+    - Taux de requêtes élevé vers même domaine racine
+    - Requêtes TXT/NULL excessives
+    - Ratio requêtes/réponses anormal
+    - Noms encodés (base32, base64 dans label)
+    """
+    def __init__(self, config: Dict):
+        cfg             = config.get("dns_tunnel", {})
+        self.enabled    = cfg.get("enabled", True)
+        self.label_min  = cfg.get("label_len_min", 45)
+        self.ent_min    = cfg.get("entropy_min", 3.8)
+        self.rate_max   = cfg.get("query_rate_max", 20)
+        self.win        = cfg.get("time_window", 10)
+        self.txt_sus    = cfg.get("txt_suspicious", True)
+        self.log        = logging.getLogger("ARGUS.DNSTunnel")
+        self._queries:  Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
+        self._roots:    Dict[str, Dict[str, deque]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=500)))
+        self._txt_cnt:  Dict[str, deque] = defaultdict(lambda: deque(maxlen=500))
+
+    def _extract_root(self, domain: str) -> str:
+        """Extrait le domaine racine (2ème niveau)."""
+        parts = domain.rstrip(".").split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else domain
+
+    def analyze(self, pkt) -> List[Alert]:
+        if not (self.enabled and SCAPY_OK): return []
+        if not (pkt.haslayer(IP) and pkt.haslayer(DNS)): return []
+        dns = pkt[DNS]; src = pkt[IP].src
+        if not dns.qr == 0: return []  # Requêtes seulement
+        alerts: List[Alert] = []
+        now = time.time()
+
+        if not pkt.haslayer(DNSQR): return []
+        try:
+            qname  = pkt[DNSQR].qname.decode(errors="replace").rstrip(".")
+            qtype  = pkt[DNSQR].qtype
+        except Exception:
+            return []
+
+        self._queries[src].append(now)
+
+        # Taux de requêtes
+        rate = FastMath.sliding_rate(self._queries[src], self.win)
+        if rate > self.rate_max:
+            alerts.append(Alert(
+                type="dns_tunnel", subtype="high_rate",
+                severity="HIGH", confidence="medium",
+                source_ip=src, domain=qname,
+                detail=f"Taux DNS anormal : {rate} requêtes/{self.win}s depuis {src}",
+            ))
+
+        # Label trop long ou haute entropie
+        labels = qname.split(".")
+        for label in labels[:-2]:  # Ignorer le TLD et domaine racine
+            if len(label) >= self.label_min:
+                ent = FastMath.entropy_str(label)
+                if ent >= self.ent_min:
+                    alerts.append(Alert(
+                        type="dns_tunnel", subtype="long_label",
+                        severity="CRITICAL", confidence="high",
+                        source_ip=src, domain=qname,
+                        entropy=round(ent, 3),
+                        dns_query_len=len(label),
+                        detail=f"DNS Tunneling ! Label={len(label)}chars ent={ent:.2f} '{label[:40]}'",
+                    ))
+                    break
+
+        # Requêtes TXT suspectes
+        if self.txt_sus and qtype == 16:  # TXT record
+            root = self._extract_root(qname)
+            self._txt_cnt[root].append(now)
+            txt_rate = FastMath.sliding_rate(self._txt_cnt[root], 60)
+            if txt_rate > 10:
+                alerts.append(Alert(
+                    type="dns_tunnel", subtype="txt_flood",
+                    severity="HIGH", confidence="medium",
+                    source_ip=src, domain=qname,
+                    dns_type="TXT",
+                    detail=f"Flood requêtes DNS TXT : {txt_rate}/min vers {root}",
+                ))
+
+        # Même root domain, trop de sous-domaines distincts
+        root = self._extract_root(qname)
+        self._roots[src][root].append((now, qname))
+        distinct = len(set(q for t,q in self._roots[src][root] if now-t <= 60))
+        if distinct > 30:
+            alerts.append(Alert(
+                type="dns_tunnel", subtype="many_subdomains",
+                severity="HIGH", confidence="medium",
+                source_ip=src, domain=root,
+                detail=f"Tunneling DNS : {distinct} sous-domaines distincts de {root} en 60s",
+            ))
+
+        return alerts
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 13 — LATERAL MOVEMENT DETECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LateralMovementDetector:
+    """
+    Détecte les mouvements latéraux :
+    - SMB/CIFS scanning interne
+    - RDP bruteforce interne
+    - WMI/DCOM execution
+    - Pass-the-Hash indicators
+    - Internal port scanning
+    - Kerberoasting (port 88 flooding)
+    """
+    SMB_PORTS  = frozenset({139, 445})
+    RDP_PORTS  = frozenset({3389, 3388})
+    WMI_PORTS  = frozenset({135, 593})
+    KERBEROS   = frozenset({88, 464})
+
+    def __init__(self, config: Dict):
+        cfg              = config.get("lateral_movement", {})
+        self.enabled     = cfg.get("enabled", True)
+        self.thresh      = cfg.get("scan_threshold", 5)
+        self.win         = cfg.get("time_window", 30)
+        self.smb         = cfg.get("smb_detect", True)
+        self.rdp         = cfg.get("rdp_detect", True)
+        self.subnets     = cfg.get("internal_subnets", ["10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"])
+        self.log         = logging.getLogger("ARGUS.LateralMove")
+        self._smb:   Dict[str, deque] = defaultdict(lambda: deque(maxlen=500))
+        self._rdp:   Dict[str, deque] = defaultdict(lambda: deque(maxlen=500))
+        self._scan:  Dict[str, Dict[str, deque]] = defaultdict(lambda: defaultdict(lambda: deque(maxlen=500)))
+        self._kerb:  Dict[str, deque] = defaultdict(lambda: deque(maxlen=500))
+
+    def _is_internal(self, ip: str) -> bool:
+        return FastMath.ip_in_subnet(ip, self.subnets)
+
+    def analyze(self, pkt) -> List[Alert]:
+        if not (self.enabled and SCAPY_OK): return []
+        if not (pkt.haslayer(IP) and pkt.haslayer(TCP)): return []
+        alerts: List[Alert] = []
+        src = pkt[IP].src; dst = pkt[IP].dst
+        tcp = pkt[TCP]; dport = tcp.dport
+        now = time.time()
+
+        # Seulement trafic interne → interne
+        if not (self._is_internal(src) and self._is_internal(dst)):
+            return alerts
+
+        # SMB Scan
+        if self.smb and dport in self.SMB_PORTS and tcp.flags & 0x02:
+            self._smb[src].append((now, dst))
+            recent_dsts = {d for t,d in self._smb[src] if now-t <= self.win}
+            if len(recent_dsts) >= self.thresh:
+                alerts.append(Alert(
+                    type="lateral_movement", subtype="smb_scan",
+                    severity="HIGH", confidence="high",
+                    source_ip=src, port=dport,
+                    target_hosts=list(recent_dsts)[:20],
+                    detail=f"SMB scan interne : {src} → {len(recent_dsts)} hôtes en {self.win}s",
+                ))
+
+        # RDP Bruteforce
+        if self.rdp and dport in self.RDP_PORTS and tcp.flags & 0x02:
+            self._rdp[src].append((now, dst))
+            recent_dsts = {d for t,d in self._rdp[src] if now-t <= self.win}
+            if len(recent_dsts) >= self.thresh:
+                alerts.append(Alert(
+                    type="lateral_movement", subtype="rdp_scan",
+                    severity="HIGH", confidence="high",
+                    source_ip=src, port=dport,
+                    target_hosts=list(recent_dsts)[:20],
+                    detail=f"RDP scan interne : {src} → {len(recent_dsts)} hôtes en {self.win}s",
+                ))
+
+        # WMI/DCOM
+        if dport in self.WMI_PORTS:
+            self._scan[src]["wmi"].append((now, dst))
+            recent = {d for t,d in self._scan[src]["wmi"] if now-t <= 60}
+            if len(recent) >= 3:
+                alerts.append(Alert(
+                    type="lateral_movement", subtype="wmi_scan",
+                    severity="MEDIUM", confidence="medium",
+                    source_ip=src, port=dport,
+                    detail=f"WMI/DCOM lateral : {src} → {len(recent)} hôtes",
+                ))
+
+        # Kerberoasting (beaucoup de requêtes TGT/TGS)
+        if dport in self.KERBEROS:
+            self._kerb[src].append(now)
+            rate = FastMath.sliding_rate(self._kerb[src], 10)
+            if rate > 20:
+                alerts.append(Alert(
+                    type="lateral_movement", subtype="kerberoasting",
+                    severity="CRITICAL", confidence="medium",
+                    source_ip=src, dest_ip=dst, port=dport,
+                    detail=f"Possible Kerberoasting : {rate} requêtes/10s vers KDC {dst}",
+                ))
+
+        return alerts
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 14 — DATA EXFILTRATION DETECTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DataExfiltrationDetector:
+    """
+    Détecte l'exfiltration de données :
+    - Gros volume sortant vers même destination
+    - Données encodées (base64, compression) dans le payload
+    - Staging (envoi groupé vers serveur externe)
+    - Fréquence/rythme d'envoi suspect
+    - Ports non-standards avec gros volumes
+    """
+    def __init__(self, config: Dict):
+        cfg                  = config.get("data_exfil", {})
+        self.enabled         = cfg.get("enabled", True)
+        self.limit_bytes     = cfg.get("outbound_limit_mb", 50) * 1024 * 1024
+        self.win             = cfg.get("time_window", 300)
+        self.comp_detect     = cfg.get("compression_detect", True)
+        self.b64_detect      = cfg.get("b64_detect", True)
+        self.staging         = cfg.get("staging_detect", True)
+        self.sus_ports       = frozenset(cfg.get("suspicious_ports",
+                                [6666,7777,8888,9999,31337,4444,55555]))
+        self.log             = logging.getLogger("ARGUS.DataExfil")
+        self._bytes_out:     Dict[str, Dict[str, List]] = defaultdict(lambda: defaultdict(list))
+        # {src: {dst: [(timestamp, bytes)]}}
+
+    def analyze(self, pkt) -> List[Alert]:
+        if not (self.enabled and SCAPY_OK): return []
+        if not (pkt.haslayer(IP) and pkt.haslayer(Raw)): return []
+        alerts: List[Alert] = []
+        src = pkt[IP].src; dst = pkt[IP].dst
+        pl  = bytes(pkt[Raw].load); now = time.time()
+        dport = pkt[TCP].dport if pkt.haslayer(TCP) else (pkt[UDP].dport if pkt.haslayer(UDP) else 0)
+
+        # Ignorer trafic entrant ou local
+        if FastMath.is_private_ip(dst) or FastMath.is_private_ip(src):
+            if FastMath.is_private_ip(dst): return alerts
+
+        # Volume sortant
+        self._bytes_out[src][dst].append((now, len(pl)))
+        # Nettoyage ancien
+        self._bytes_out[src][dst] = [(t, b) for t, b in self._bytes_out[src][dst] if now-t <= self.win]
+        total = sum(b for _, b in self._bytes_out[src][dst])
+
+        if total >= self.limit_bytes:
+            alerts.append(Alert(
+                type="data_exfil", subtype="large_outbound",
+                severity="CRITICAL", confidence="high",
+                source_ip=src, dest_ip=dst, port=dport,
+                bytes_out=total,
+                duration_s=self.win,
+                detail=f"Exfiltration probable : {total//1024//1024}MB → {dst} en {self.win}s",
+            ))
+            # Reset compteur
+            self._bytes_out[src][dst] = []
+
+        # Port suspect + payload
+        if dport in self.sus_ports and len(pl) > 1024:
+            alerts.append(Alert(
+                type="data_exfil", subtype="suspicious_port",
+                severity="HIGH", confidence="medium",
+                source_ip=src, dest_ip=dst, port=dport,
+                bytes_out=len(pl),
+                detail=f"Gros payload ({len(pl)}B) sur port suspect {dport}",
+            ))
+
+        # Base64 dans payload
+        if self.b64_detect and len(pl) > 200:
+            try:
+                # Chercher des blocs base64 longs
+                b64_re = re.compile(rb"[A-Za-z0-9+/]{60,}={0,2}")
+                matches = b64_re.findall(pl)
+                if matches and len(matches[0]) > 200:
+                    alerts.append(Alert(
+                        type="data_exfil", subtype="b64_encoded",
+                        severity="MEDIUM", confidence="medium",
+                        source_ip=src, dest_ip=dst, port=dport,
+                        detail=f"Données base64 suspectes dans payload ({len(matches[0])}B) → {dst}",
+                    ))
+            except Exception:
+                pass
+
+        # Données compressées (zlib/gzip magic bytes)
+        if self.comp_detect:
+            if pl[:2] in (b"\x1f\x8b", b"\x78\x9c", b"\x78\x01", b"\x78\xda"):
+                if len(pl) > 10240:
+                    alerts.append(Alert(
+                        type="data_exfil", subtype="compressed_transfer",
+                        severity="MEDIUM", confidence="low",
+                        source_ip=src, dest_ip=dst, port=dport,
+                        bytes_out=len(pl),
+                        detail=f"Transfert compressé suspect ({len(pl)//1024}KB) → {dst}",
+                    ))
+
+        return alerts
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 15 — PCAP EXPORTER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PCAPExporter:
+    """
+    Capture et sauvegarde automatiquement les paquets suspects en fichiers PCAP
+    pour analyse forensique ultérieure (Wireshark, tcpdump...).
+    """
+    SEV_RANK = {"LOW":1,"MEDIUM":2,"HIGH":3,"CRITICAL":4}
+
+    def __init__(self, config: Dict):
+        cfg            = config.get("pcap", {})
+        self.enabled   = cfg.get("enabled", True) and SCAPY_OK
+        self.auto      = cfg.get("auto_capture", True)
+        self.max_bytes = cfg.get("max_size_mb", 100) * 1024 * 1024
+        self.rotate    = cfg.get("rotate_count", 10)
+        self.min_sev   = cfg.get("min_severity", "HIGH")
+        self.out_dir   = Path(config.get("pcap_dir", "output/pcap"))
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.log       = logging.getLogger("ARGUS.PCAP")
+        self._writers: Dict[str, Any] = {}
+        self._sizes:   Dict[str, int] = {}
+        self._lock     = threading.Lock()
+
+    def _get_writer(self, key: str, label: str) -> Optional[Any]:
+        if not self.enabled: return None
+        if key not in self._writers:
+            fname = self.out_dir / f"{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pcap"
+            try:
+                self._writers[key] = (str(fname), open(fname, "wb"))
+                self._sizes[key]   = 0
+                self.log.info("PCAP ouvert : %s", fname.name)
+            except Exception as e:
+                self.log.error("PCAP open : %s", e); return None
+        return self._writers[key]
+
+    def capture(self, pkt, alert: Alert) -> Optional[str]:
+        if not (self.enabled and self.auto): return None
+        if self.SEV_RANK.get(alert.severity, 0) < self.SEV_RANK.get(self.min_sev, 3): return None
+        key   = f"{alert.type}_{alert.source_ip or 'unk'}"
+        label = f"{alert.type}_{(alert.source_ip or 'unk').replace('.','_')}"
+        with self._lock:
+            result = self._get_writer(key, label)
+            if not result: return None
+            fname, fobj = result
+            try:
+                wrpcap(fname, [pkt], append=True)
+                self._sizes[key] = self._sizes.get(key, 0) + len(bytes(pkt))
+                # Rotation si trop grand
+                if self._sizes[key] >= self.max_bytes:
+                    fobj.close()
+                    del self._writers[key], self._sizes[key]
+                    self.log.info("PCAP rotaté : %s", fname)
+                return fname
+            except Exception:
+                return None
+
+    def list_captures(self) -> List[Dict]:
+        captures = []
+        for f in self.out_dir.glob("*.pcap"):
+            captures.append({
+                "file": f.name,
+                "size_kb": f.stat().st_size // 1024,
+                "modified": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
+            })
+        return sorted(captures, key=lambda x: x["modified"], reverse=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 16 — INCIDENT RESPONSE PLAYBOOK
+# ══════════════════════════════════════════════════════════════════════════════
+
+class IncidentPlaybook:
+    """
+    Exécute des playbooks de réponse automatisés selon le type d'alerte :
+    - Blocage IP automatique
+    - Notification webhook/Slack/email
+    - Création de règles YARA dynamiques
+    - Escalade vers SOC
+    - Honeypot redirect
+    - Documentation d'incident
+    """
+    PLAYBOOKS = {
+        "port_scan":        ["log_incident","throttle_ip","notify_soc"],
+        "ssh_bruteforce":   ["log_incident","block_ip","notify_soc","add_ioc"],
+        "http_sqli":        ["log_incident","block_ip","notify_soc"],
+        "http_rce":         ["log_incident","block_ip","notify_soc","escalate"],
+        "cve_exploit":      ["log_incident","block_ip","notify_soc","escalate","pcap_start"],
+        "backdoor_behavior":["log_incident","block_ip","notify_soc","escalate"],
+        "dns_tunnel":       ["log_incident","block_ip","notify_soc"],
+        "data_exfil":       ["log_incident","block_ip","notify_soc","escalate"],
+        "lateral_movement": ["log_incident","isolate_segment","notify_soc","escalate"],
+        "wifi_evil_twin":   ["log_incident","deauth_rogue","notify_soc"],
+        "wifi_deauth":      ["log_incident","notify_soc"],
+        "threat_intel_hit": ["log_incident","block_ip","notify_soc","add_ioc"],
+        "dns_beaconing":    ["log_incident","block_ip","notify_soc"],
+        "dga_domain":       ["log_incident","notify_soc","add_ioc"],
+        "default":          ["log_incident"],
+    }
+
+    def __init__(self, config: Dict, iface_mgr: KaliInterfaceManager,
+                 db: "DatabaseManager", ti: "ThreatIntelligence"):
+        self.cfg         = config.get("playbook", {})
+        self.enabled     = self.cfg.get("enabled", True)
+        self.auto_isolate = self.cfg.get("auto_isolate", False)
+        self.webhook     = self.cfg.get("notify_webhook", "")
+        self.slack       = self.cfg.get("notify_slack", "")
+        self.iface       = iface_mgr
+        self.db          = db
+        self.ti          = ti
+        self.log         = logging.getLogger("ARGUS.Playbook")
+        self._executed:  Dict[str, int] = defaultdict(int)  # incident_id → actions_count
+        self._history:   deque = deque(maxlen=1000)
+
+    def execute(self, alert: Alert, iface_mgr: KaliInterfaceManager) -> List[str]:
+        if not self.enabled: return []
+        steps    = self.PLAYBOOKS.get(alert.type, self.PLAYBOOKS["default"])
+        executed = []
+        for step in steps:
+            fn = getattr(self, f"_step_{step}", None)
+            if fn:
+                try:
+                    result = fn(alert, iface_mgr)
+                    if result: executed.append(f"{step}:{result}")
+                except Exception as e:
+                    self.log.error("Playbook step %s : %s", step, e)
+        inc = (alert.brain or {}).get("incident_id","?")
+        self._executed[inc] += len(executed)
+        self._history.append({"ts":time.time(),"incident":inc,
+                              "type":alert.type,"steps":executed})
+        return executed
+
+    def _step_log_incident(self, alert: Alert, iface_mgr) -> str:
+        report_dir = Path("output/incidents")
+        report_dir.mkdir(parents=True, exist_ok=True)
+        inc = (alert.brain or {}).get("incident_id", "UNK")
+        fname = report_dir / f"{inc}_{alert.type}.json"
+        fname.write_text(json.dumps(alert.to_dict(), indent=2))
+        return f"logged:{fname.name}"
+
+    def _step_block_ip(self, alert: Alert, iface_mgr: KaliInterfaceManager) -> str:
+        ip = alert.source_ip
+        if not ip: return ""
+        if iface_mgr.block_ip(ip, f"Playbook:{alert.type}"):
+            self.db.add_blocked_ip(ip, f"Auto-block: {alert.type}", expires_h=24)
+            return f"blocked:{ip}"
+        return ""
+
+    def _step_throttle_ip(self, alert: Alert, iface_mgr: KaliInterfaceManager) -> str:
+        ip = alert.source_ip
+        if not ip: return ""
+        if iface_mgr.throttle_ip(ip, kbps=128):
+            return f"throttled:{ip}"
+        return ""
+
+    def _step_isolate_segment(self, alert: Alert, iface_mgr: KaliInterfaceManager) -> str:
+        if not self.auto_isolate: return "isolation:manual_required"
+        ip = alert.source_ip
+        if ip:
+            iface_mgr.block_ip(ip, f"Isolation:{alert.type}")
+            return f"isolated:{ip}"
+        return ""
+
+    def _step_notify_soc(self, alert: Alert, iface_mgr) -> str:
+        if not (self.webhook or self.slack): return "no_webhook_configured"
+        payload = {
+            "text": f"🚨 ARGUS IDS Alert | {alert.severity} | {alert.type}",
+            "attachments": [{
+                "color": "danger" if alert.severity in ("CRITICAL","HIGH") else "warning",
+                "fields": [
+                    {"title":"Type",     "value":alert.type,           "short":True},
+                    {"title":"Severity", "value":alert.severity,       "short":True},
+                    {"title":"Source IP","value":alert.source_ip or "?","short":True},
+                    {"title":"MITRE",    "value":alert.mitre_id,       "short":True},
+                    {"title":"Detail",   "value":alert.detail[:200],   "short":False},
+                ]
+            }]
+        }
+        target = self.slack or self.webhook
+        if REQUESTS_OK and target:
+            try:
+                http_req.post(target, json=payload, timeout=5)
+                return f"notified:{target[:30]}"
+            except Exception as e:
+                return f"notify_failed:{e}"
+        return "requests_unavailable"
+
+    def _step_escalate(self, alert: Alert, iface_mgr) -> str:
+        inc = (alert.brain or {}).get("incident_id", "UNK")
+        self.log.critical(
+            "🔴 ESCALADE SOC | %s | %s | %s | %s",
+            inc, alert.severity, alert.type,
+            alert.source_ip or alert.domain or "?"
+        )
+        return f"escalated:{inc}"
+
+    def _step_add_ioc(self, alert: Alert, iface_mgr) -> str:
+        if alert.source_ip and not FastMath.is_private_ip(alert.source_ip):
+            self.ti.add_ioc("ip", alert.source_ip, source=f"auto:{alert.type}")
+            return f"ioc_added:{alert.source_ip}"
+        if alert.domain:
+            self.ti.add_ioc("domain", alert.domain, source=f"auto:{alert.type}")
+            return f"ioc_added:{alert.domain}"
+        return ""
+
+    def _step_deauth_rogue(self, alert: Alert, iface_mgr: KaliInterfaceManager) -> str:
+        if alert.bssid and alert.mac_src:
+            iface_mgr.deauth_station(alert.bssid, alert.mac_src)
+            return f"deauth:{alert.bssid}"
+        return ""
+
+    def _step_pcap_start(self, alert: Alert, iface_mgr) -> str:
+        return "pcap:auto_capture_active"
+
+    @property
+    def recent_actions(self) -> List[Dict]:
+        return list(self._history)[-20:]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 17 — DÉTECTEURS EXISTANTS (améliorés)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DNSBeaconDetector:
+    WHITELIST = frozenset({
+        "google.com","microsoft.com","apple.com","cloudflare.com",
+        "akamai.com","fastly.com","amazonaws.com","azure.com",
+        "googleapiscom","gstatic.com","googleapis.com",
+    })
+    def __init__(self, config):
+        t = config.get("thresholds", {})
+        self.min_iv = t.get("dns_beacon_interval_min", 5)
+        self.max_iv = t.get("dns_beacon_interval_max", 20)
+        self.min_n  = t.get("dns_beacon_min_samples", 5)
+        self.hist: Dict[str, deque] = defaultdict(lambda: deque(maxlen=120))
+        self.log = logging.getLogger("ARGUS.DNS")
+
+    def analyze(self, domain: str) -> Optional[Alert]:
+        root = ".".join(domain.split(".")[-2:])
+        if root in self.WHITELIST: return None
+        now = time.time(); self.hist[domain].append(now)
+        ts  = list(self.hist[domain])
+        if len(ts) < self.min_n: return None
+        ivs = [ts[i]-ts[i-1] for i in range(1,len(ts))]
+        avg = sum(ivs)/len(ivs)
+        std = (sum((x-avg)**2 for x in ivs)/len(ivs))**0.5
+        cv  = std/avg if avg > 0 else 1.0
+        if self.min_iv < avg < self.max_iv:
+            conf = "high" if cv < 0.15 else "medium"
+            return Alert(type="dns_beaconing",
+                severity="HIGH" if conf=="high" else "MEDIUM",
+                confidence=conf, domain=domain,
+                detail=f"Beaconing DNS | avg={avg:.1f}s cv={cv:.3f} n={len(ts)}")
+        return None
+
+
+class TLSAnalyzer:
+    MALICIOUS_JA3 = frozenset({
+        "e7d705a3286e19ea42f587b344ee6865",  # Cobalt Strike
+        "a0e9f5d64349fb13191bc781f81f42e1",  # Meterpreter
+        "6bea65232c1288defa4bf058f5e99601",  # Dridex
+        "51c64c77e60f3980eea90869b68c58a8",  # Trickbot
+        "72a589da586844d7f0818ce684948eea",  # Emotet
+        "d0ec4b50a944b182f66484f0fea58b5c",  # QakBot
+    })
+    KNOWN_GOOD = frozenset({"modern_browser_tls","chrome_tls_1.3",
+                            "firefox_tls_1.3","safari_tls_1.3"})
+
+    def compute_ja3(self, pkt) -> Optional[str]:
+        if not (SCAPY_OK and pkt.haslayer(TCP) and pkt.haslayer(Raw)): return None
+        try:
+            v, c, e = FastMath.parse_ja3(bytes(pkt[Raw].load))
+            return f"{v},{c},{e}" if v else None
+        except Exception: return None
+
+    def analyze(self, fp: str, pkt=None) -> Optional[Alert]:
+        if pkt:
+            raw = self.compute_ja3(pkt)
+            if raw: fp = hashlib.md5(raw.encode()).hexdigest()
+        if fp in self.KNOWN_GOOD: return None
+        sev  = "CRITICAL" if fp in self.MALICIOUS_JA3 else "LOW"
+        conf = "high" if sev == "CRITICAL" else "low"
+        detail = ("JA3 C2 connu (Cobalt Strike/Meterpreter/Emotet)" if sev=="CRITICAL"
+                  else "Bibliothèque TLS inconnue")
+        return Alert(type="tls_anomaly", severity=sev, confidence=conf,
+            fingerprint=fp, detail=detail)
+
+
+class DGADetector:
+    def __init__(self, model_path):
+        self.model = None; self.log = logging.getLogger("ARGUS.DGA")
+        if JOBLIB_OK and Path(model_path).exists():
+            try: self.model = joblib.load(model_path)
+            except Exception as e: self.log.error("DGA model : %s", e)
+
+    def _feats(self, domain):
+        label = domain.split(".")[0]
+        return [len(label), FastMath.entropy_str(label), label.count("-"),
+                sum(c.isdigit() for c in label), FastMath.consonant_ratio(label),
+                len(re.findall(r"[0-9]{3,}", label))]
+
+    def _heur(self, domain):
+        label = domain.split(".")[0]
+        return (len(label)>15 and FastMath.entropy_str(label)>3.5
+                and FastMath.consonant_ratio(label)>0.72)
+
+    def analyze(self, domain):
+        f = self._feats(domain)
+        is_dga = bool(self.model.predict([f])[0]==1) if self.model else self._heur(domain)
+        if is_dga:
+            ent = round(f[1], 3)
+            return Alert(type="dga_domain", severity="HIGH",
+                confidence="high" if self.model else "medium",
+                domain=domain, entropy=ent,
+                detail=f"Domaine DGA (entropie={ent}, len={len(domain.split('.')[0])})")
+        return None
+
+
+class YaraScanner:
+    def __init__(self, rules_path):
+        self.rules = None; self._lock = threading.Lock()
+        self.log = logging.getLogger("ARGUS.YARA")
+        if YARA_OK and Path(rules_path).exists():
+            try: self.rules = yara.compile(filepath=str(rules_path))
+            except yara.SyntaxError as e: self.log.error("YARA : %s", e)
+
+    def add_rule(self, text):
+        if not YARA_OK or not text: return False
+        if any(bad in text for bad in ("import ","include ","__")): return False
+        try:
+            c = yara.compile(source=text)
+            with self._lock: self.rules = c; return True
+        except yara.SyntaxError: return False
+
+    def scan(self, payload):
+        if not self.rules: return []
+        try:
+            with self._lock: return [m.rule for m in self.rules.match(data=payload)]
+        except Exception: return []
+
+
+class BufferOverflowDetector:
+    def __init__(self, config):
+        t = config.get("thresholds", {})
+        self.limits = t.get("payload_size", {"80":8192,"443":16384,"default":4096})
+        self.ent_th = t.get("high_entropy", 7.8)
+
+    def analyze(self, pkt):
+        if not (SCAPY_OK and pkt.haslayer(IP) and pkt.haslayer(Raw)): return []
+        pl = bytes(pkt[Raw].load)
+        src = pkt[IP].src; dst = pkt[IP].dst
+        dp  = pkt[TCP].dport if pkt.haslayer(TCP) else 0
+        lim = int(self.limits.get(str(dp)) or self.limits.get("default",4096))
+        ent = FastMath.entropy_bytes(pl)
+        alerts = []
+        if len(pl) > lim:
+            alerts.append(Alert(type="buffer_overflow",subtype="oversized",
+                severity="HIGH",confidence="medium",source_ip=src,dest_ip=dst,port=dp,
+                payload_len=len(pl),detail=f"Payload {len(pl)}B > limite {lim}B"))
+        if ent > self.ent_th:
+            alerts.append(Alert(type="buffer_overflow",subtype="high_entropy",
+                severity="HIGH",confidence="medium",source_ip=src,dest_ip=dst,port=dp,
+                entropy=round(ent,3),detail=f"Entropie payload {ent:.3f} > {self.ent_th}"))
+        if FastMath.nop_sled(pl):
+            alerts.append(Alert(type="buffer_overflow",subtype="nop_sled",
+                severity="CRITICAL",confidence="high",source_ip=src,dest_ip=dst,port=dp,
+                detail="NOP sled détecté — shellcode x86/x64"))
+        return alerts
+
+
+class BackdoorDetector:
+    RAT_PORTS     = frozenset({4444,1337,31337,9001,9002,8443,6666,5555,7777,55555})
+    SHELL_MARKERS = frozenset({b"/bin/sh",b"/bin/bash",b"cmd.exe",b"powershell",b"netcat",b"nc -e",b"bash -i"})
+
+    def analyze(self, pkt):
+        if not (SCAPY_OK and pkt.haslayer(IP) and pkt.haslayer(TCP)): return []
+        src=pkt[IP].src; dst=pkt[IP].dst; dp=pkt[TCP].dport; sp=pkt[TCP].sport
+        alerts = []
+        sp_ = dp if dp in self.RAT_PORTS else (sp if sp in self.RAT_PORTS else None)
+        if sp_:
+            alerts.append(Alert(type="backdoor_behavior",subtype="rat_port",
+                severity="HIGH",confidence="medium",source_ip=src,dest_ip=dst,port=sp_,
+                detail=f"Port RAT connu {sp_}"))
+        if pkt.haslayer(Raw):
+            pl = bytes(pkt[Raw].load)
+            for kw in self.SHELL_MARKERS:
+                if kw in pl:
+                    alerts.append(Alert(type="backdoor_behavior",subtype="shell_keyword",
+                        severity="CRITICAL",confidence="high",source_ip=src,dest_ip=dst,
+                        detail=f"Mot-clé shell '{kw.decode()}' dans payload"))
+                    break
+        return alerts
+
+
+class CVEMatcher:
+    SIGS = [
+        {"cve_id":"CVE-2021-44228","pattern":b"${jndi:ldap://",    "severity":"CRITICAL","detail":"Log4Shell JNDI injection"},
+        {"cve_id":"CVE-2021-26855","pattern":b"X-AnonResource-Backend","severity":"CRITICAL","detail":"ProxyLogon SSRF (Exchange)"},
+        {"cve_id":"CVE-2017-0144", "pattern":b"\x00SMB",            "severity":"CRITICAL","detail":"EternalBlue SMB exploit"},
+        {"cve_id":"CVE-2020-1472", "pattern":b"ZeroLogon",          "severity":"CRITICAL","detail":"Zerologon Netlogon"},
+        {"cve_id":"CVE-2021-34527","pattern":b"PrintNightmare",     "severity":"CRITICAL","detail":"PrintNightmare RCE"},
+        {"cve_id":"CVE-2022-30190","pattern":b"ms-msdt:",           "severity":"CRITICAL","detail":"Follina MSDT RCE"},
+        {"cve_id":"CVE-2023-44487","pattern":b"RST_STREAM",         "severity":"HIGH",    "detail":"HTTP/2 Rapid Reset DDoS"},
+        {"cve_id":"CVE-2024-3400", "pattern":b"GlobalProtect",      "severity":"CRITICAL","detail":"PAN-OS GlobalProtect RCE"},
+        {"cve_id":"CVE-2023-23397","pattern":b"//UNC",              "severity":"CRITICAL","detail":"Outlook NTLM Hash Theft"},
+        {"cve_id":"CVE-2024-21762","pattern":b"Node.js",            "severity":"HIGH",    "detail":"Fortinet SSL-VPN RCE"},
+    ]
+
+    def analyze(self, pkt):
+        if not (SCAPY_OK and pkt.haslayer(Raw)): return []
+        pl  = bytes(pkt[Raw].load)
+        src = pkt[IP].src if pkt.haslayer(IP) else "?"
+        return [Alert(type="cve_exploit",severity=s["severity"],confidence="high",
+                      cve_id=s["cve_id"],source_ip=src,detail=s["detail"])
+                for s in self.SIGS if s["pattern"] in pl]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 18 — WiFi DETECTOR (enrichi)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class WiFiDetector:
+    def __init__(self, config: Dict):
+        self.cfg           = config.get("wifi", {})
+        self.deauth_thresh = self.cfg.get("deauth_threshold", 10)
+        self.probe_thresh  = self.cfg.get("probe_threshold", 20)
+        self.detect_pmkid  = self.cfg.get("pmkid_detect", True)
+        self.detect_twin   = self.cfg.get("evil_twin_detect", True)
+        self.log           = logging.getLogger("ARGUS.WiFi")
+        self._deauth:     Dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
+        self._probes:     Dict[str, deque] = defaultdict(lambda: deque(maxlen=200))
+        self._aps:        Dict[str, str]   = {}
+        self._ap_channels:Dict[str, int]   = {}
+        self._handshakes: Dict[str, List]  = defaultdict(list)
+        self._arp_cache:  Dict[str, str]   = {}
+        self._deauth_targets: Dict[str, Set[str]] = defaultdict(set)
+
+    def analyze(self, pkt) -> List[Alert]:
+        if not SCAPY_OK: return []
+        alerts: List[Alert] = []
+        if pkt.haslayer(Dot11Beacon):        alerts.extend(self._check_beacon(pkt))
+        elif pkt.haslayer(Dot11Deauth):      alerts.extend(self._check_deauth(pkt))
+        elif pkt.haslayer(Dot11ProbeReq):    alerts.extend(self._check_probe(pkt))
+        elif pkt.haslayer(EAPOL):            alerts.extend(self._check_eapol(pkt))
+        elif pkt.haslayer(ARP):              alerts.extend(self._check_arp(pkt))
+        return alerts
+
+    def _get_ssid(self, pkt) -> str:
+        try: return pkt[Dot11Elt].info.decode("utf-8", errors="replace")
+        except Exception: return "?"
+
+    def _get_rssi(self, pkt) -> Optional[int]:
+        try: return -(256 - pkt[RadioTap].dBm_AntSignal) if pkt.haslayer(RadioTap) else None
+        except Exception: return None
+
+    def _check_beacon(self, pkt) -> List[Alert]:
+        alerts = []
+        if not self.detect_twin: return alerts
+        try:
+            ssid  = self._get_ssid(pkt)
+            bssid = pkt[Dot11].addr3 or pkt[Dot11].addr2
+            rssi  = self._get_rssi(pkt)
+            if not ssid or ssid == "?": return alerts
+            if ssid in self._aps and self._aps[ssid] != bssid:
+                alerts.append(Alert(
+                    type="wifi_evil_twin", severity="CRITICAL", confidence="high",
+                    bssid=bssid, ssid=ssid, rssi=rssi, source="wlan1",
+                    detail=f"Evil Twin AP ! SSID='{ssid}' | Légitime={self._aps[ssid]} | Rogue={bssid}",
+                ))
+            else:
+                self._aps[ssid] = bssid
+        except Exception: pass
+        return alerts
+
+    def _check_deauth(self, pkt) -> List[Alert]:
+        alerts = []
+        try:
+            src = pkt[Dot11].addr2 or "?"; dst = pkt[Dot11].addr1 or "?"
+            now = time.time()
+            self._deauth[src].append(now)
+            self._deauth_targets[src].add(dst)
+            recent = sum(1 for t in self._deauth[src] if now-t < 30)
+            if recent >= self.deauth_thresh:
+                sev = "CRITICAL" if len(self._deauth_targets[src]) > 3 else "HIGH"
+                alerts.append(Alert(
+                    type="wifi_deauth", severity=sev, confidence="high",
+                    mac_src=src, mac_dst=dst, source="wlan1",
+                    detail=f"Deauth flood : {recent}/30s | {len(self._deauth_targets[src])} cibles | src={src}",
+                ))
+        except Exception: pass
+        return alerts
+
+    def _check_probe(self, pkt) -> List[Alert]:
+        alerts = []
+        try:
+            mac = pkt[Dot11].addr2 or "?"; now = time.time()
+            self._probes[mac].append(now)
+            recent = sum(1 for t in self._probes[mac] if now-t < 60)
+            if recent >= self.probe_thresh:
+                alerts.append(Alert(
+                    type="wifi_probe", severity="MEDIUM", confidence="medium",
+                    mac_src=mac, source="wlan1",
+                    detail=f"Probe flood : {recent}/60s depuis {mac} — scan passif de réseaux",
+                ))
+        except Exception: pass
+        return alerts
+
+    def _check_eapol(self, pkt) -> List[Alert]:
+        alerts = []
+        try:
+            bssid = pkt[Dot11].addr3 or pkt[Dot11].addr1 or "?"
+            self._handshakes[bssid].append(time.time())
+            times = [t for t in self._handshakes[bssid] if time.time()-t < 5]
+            if len(times) >= 4:
+                alerts.append(Alert(
+                    type="wifi_handshake", severity="HIGH", confidence="high",
+                    bssid=bssid, source="wlan1",
+                    detail=f"Handshake WPA2 capturé (EAPOL 4-way) — BSSID={bssid} — cracking possible",
+                ))
+                self._handshakes[bssid] = []
+            if self.detect_pmkid and pkt.haslayer(Raw):
+                raw = bytes(pkt[Raw].load)
+                if b"\xdd\x16\x00\x0f\xac" in raw or (len(raw) > 80 and raw[4] == 3):
+                    alerts.append(Alert(
+                        type="wifi_pmkid", severity="CRITICAL", confidence="medium",
+                        bssid=bssid, source="wlan1",
+                        detail=f"Attaque PMKID détectée — BSSID={bssid} — WPA2/3 cracking sans handshake",
+                    ))
+        except Exception: pass
+        return alerts
+
+    def _check_arp(self, pkt) -> List[Alert]:
+        alerts = []
+        try:
+            arp = pkt[ARP]; ip = arp.psrc; mac = arp.hwsrc
+            if not ip or not mac: return alerts
+            if ip in self._arp_cache and self._arp_cache[ip] != mac:
+                alerts.append(Alert(
+                    type="arp_spoofing", severity="HIGH", confidence="high",
+                    source_ip=ip, mac_src=mac, source="wlan0",
+                    detail=f"ARP Spoofing : {ip} → MAC {self._arp_cache[ip]} → {mac}",
+                ))
+            self._arp_cache[ip] = mac
+        except Exception: pass
+        return alerts
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 19 — CHANNEL HOPPER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ChannelHopper:
+    def __init__(self, config: Dict, iface_mgr: KaliInterfaceManager):
+        self.cfg      = config.get("wifi", {})
+        self.iface    = iface_mgr
+        self.channels = self.cfg.get("channels", list(range(1, 14)))
+        self.interval = self.cfg.get("hop_interval", 0.3)
+        self._stop    = threading.Event()
+        self._current = 0
+        self.log      = logging.getLogger("ARGUS.ChanHop")
+
+    def start(self) -> None:
+        t = threading.Thread(target=self._hop, daemon=True, name="ChanHopper")
+        t.start()
+        self.log.info("Channel hopping actif : %d canaux, %.1fs/canal",
+                      len(self.channels), self.interval)
+
+    def _hop(self) -> None:
+        while not self._stop.is_set():
+            ch = self.channels[self._current % len(self.channels)]
+            self.iface.set_channel(ch)
+            self._current += 1
+            time.sleep(self.interval)
+
+    def stop(self) -> None: self._stop.set()
+
+    @property
+    def current_channel(self) -> int:
+        return self.channels[self._current % len(self.channels)]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 20 — LIGHTGBM CORRELATION MODEL
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LGBMCorrelationModel:
+    SEV  = {"LOW":1,"MEDIUM":2,"HIGH":3,"CRITICAL":4}
+    CONF = {"low":1,"medium":2,"high":3}
+
+    def __init__(self, config, db):
+        self.cfg    = config; self.db = db
+        self.log    = logging.getLogger("ARGUS.LGBM")
+        self.model  = None
+        self.enabled = config.get("enabled", True) and LGBM_OK and NP_OK
+        self._cnt   = 0
+        self._every = config.get("retrain_every", 500)
+        self._mpath = config.get("model_path", "models/lgbm_correlation.pkl")
+        self._thresh = config.get("risk_thresholds",
+                                  {"MONITOR":0.3,"ALERT":0.55,"BLOCK_IP":0.75,"ISOLATE":0.90})
+        self._ip_hist: Dict[str, deque] = defaultdict(lambda: deque(maxlen=500))
+        if self.enabled: self._load()
+
+    def _feats(self, alert: Alert) -> Optional[List[float]]:
+        if not NP_OK: return None
+        ip = alert.source_ip or "?"; now = time.time()
+        h  = self._ip_hist.get(ip, deque())
+        c5  = sum(1 for ts,_,_ in h if now-ts<300)
+        c1h = sum(1 for ts,_,_ in h if now-ts<3600)
+        t5  = len(set(t for ts,t,_ in h if now-ts<300))
+        p5  = len(set(p for ts,_,p in h if now-ts<300 and p))
+        ts_dt = datetime.utcfromtimestamp(alert.timestamp)
+        tod   = ts_dt.hour + ts_dt.minute/60.0
+        return [
+            self.SEV.get(alert.severity,1), self.CONF.get(alert.confidence,1),
+            min(c5,50), min(c1h,200), min(t5,10), min(p5,20),
+            math.sin(2*math.pi*tod/24), math.cos(2*math.pi*tod/24),
+            FastMath.entropy_str(alert.domain or ""), alert.entropy or 0.0,
+            alert.geo_risk, 1.0 if alert.threat_intel else 0.0,
+        ]
+
+    def score(self, alert: Alert) -> float:
+        ip = alert.source_ip or "?"
+        self._ip_hist[ip].append((alert.timestamp, alert.type, alert.port))
+        self._cnt += 1
+        if self._cnt % self._every == 0:
+            threading.Thread(target=self._train, daemon=True, name="LGBM-Train").start()
+        if not (self.enabled and self.model):
+            return self._heur(alert)
+        f = self._feats(alert)
+        if f is None: return self._heur(alert)
+        try:
+            return float(max(0.0, min(1.0, self.model.predict(
+                np.array(f, dtype=np.float32).reshape(1,-1))[0])))
+        except Exception: return self._heur(alert)
+
+    def _heur(self, alert: Alert) -> float:
+        base  = self.SEV.get(alert.severity,1)/4.0*0.6
+        conf  = self.CONF.get(alert.confidence,1)/3.0*0.2
+        geo   = alert.geo_risk * 0.1
+        ti    = 0.1 if alert.threat_intel else 0.0
+        return min(1.0, base + conf + geo + ti)
+
+    def action_from_score(self, s: float) -> str:
+        t = self._thresh
+        if s >= t.get("ISOLATE",0.90): return "ISOLATE"
+        if s >= t.get("BLOCK_IP",0.75): return "BLOCK_IP"
+        if s >= t.get("ALERT",0.55): return "ALERT"
+        return "MONITOR"
+
+    def _train(self) -> None:
+        if not (self.enabled and LGBM_OK and NP_OK): return
+        res = self.db.export_training_data()
+        if res is None: return
+        X, y = res
+        if len(X) < self.cfg.get("min_train_rows",50): return
+        try:
+            m = lgb.LGBMRegressor(objective="regression",num_leaves=63,
+                learning_rate=0.03,n_estimators=300,subsample=0.8,
+                colsample_bytree=0.8,n_jobs=4,verbose=-1)
+            m.fit(X, y); self.model = m
+            Path(self._mpath).parent.mkdir(parents=True, exist_ok=True)
+            with open(self._mpath,"wb") as f: pickle.dump(m, f)
+            self.log.info("LGBM entraîné (%d samples)", len(X))
+        except Exception as e: self.log.error("LGBM train : %s", e)
+
+    def _load(self):
+        if not Path(self._mpath).exists(): return
+        try:
+            with open(self._mpath,"rb") as f: self.model = pickle.load(f)
+            self.log.info("LGBM chargé : %s", self._mpath)
+        except Exception as e: self.log.warning("LGBM load : %s", e)
+
+    def train_from_db(self): self._train()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 21 — ARGUS BRAIN v3
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ARGUSBrain:
+    SEV_W = {"CRITICAL":10,"HIGH":7,"MEDIUM":4,"LOW":1}
+
+    def __init__(self, config, mitre, lgbm, db):
+        self.mitre    = mitre; self.lgbm = lgbm; self.db = db
+        self.learning = config.get("interfaces",{}).get("learning_mode", False)
+        self.memory:  Dict[str, deque] = defaultdict(lambda: deque(maxlen=500))
+        self._chain:  Dict[str, List]  = defaultdict(list)   # kill chain tracking
+        self.log = logging.getLogger("ARGUS.Brain")
+
+    def process(self, alert: Alert) -> Dict:
+        src = alert.source_ip or alert.bssid or alert.domain or "?"
+        self.memory[src].append((time.time(), alert.severity, alert.type))
+        m = self.mitre.map(alert.type)
+        alert.mitre_id    = m["id"]
+        alert.mitre_tactic = m["tactic"]
+        alert.kill_chain  = m.get("kill_chain", "unknown")
+
+        # Kill chain tracking
+        self._chain[src].append(alert.kill_chain)
+        chain_stages = set(self._chain[src][-10:])
+
+        # Multi-signal correlation
+        recent = sum(1 for ts,_,_ in self.memory[src] if time.time()-ts<300)
+        recent_types = {t for ts,_,t in self.memory[src] if time.time()-ts<300}
+
+        # Escalade si progression dans kill chain
+        if len(chain_stages) >= 3:
+            alert.severity = "CRITICAL"
+            alert.detail  += f" [KILL-CHAIN:{'>'.join(list(chain_stages)[:3])}]"
+        elif recent >= 3:
+            alert.severity = "CRITICAL"
+            alert.detail  += " [CORRÉLATION MULTI-SIGNAL]"
+
+        if self.lgbm:
+            prob   = self.lgbm.score(alert)
+            alert.lgbm_score = round(prob, 4)
+            risk   = round(prob*10, 2)
+            action = self.lgbm.action_from_score(prob)
+        else:
+            base   = self.SEV_W.get(alert.severity,1)
+            bonus  = min(recent/5, 1.0)*0.3 + alert.geo_risk*0.2 + (0.3 if alert.threat_intel else 0.0)
+            risk   = min(round(base*(1+bonus), 2), 10.0)
+            s      = risk/10.0
+            action = ("ISOLATE" if s>=0.90 else "BLOCK_IP" if s>=0.75
+                      else "ALERT" if s>=0.55 else "MONITOR")
+
+        result = {
+            "incident_id":        self.db.next_incident_id(),
+            "risk_score":         risk,
+            "recommended_action": action,
+            "escalate":           alert.severity == "CRITICAL",
+            "correlated_alerts":  recent,
+            "distinct_types":     len(recent_types),
+            "kill_chain_stages":  len(chain_stages),
+            "scored_by":          "lgbm" if (self.lgbm and self.lgbm.model) else "heuristic",
+            "threat_intel":       alert.threat_intel,
+            "geo_risk":           round(alert.geo_risk, 2),
+        }
+        alert.brain = result
+        return result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 22 — ZEEK CONSUMER (enrichi HTTP/SSH)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ZeekConsumer:
+    HANDLERS = {"dns.log":"_dns","ssl.log":"_ssl","conn.log":"_conn",
+                "files.log":"_files","weird.log":"_weird",
+                "http.log":"_http","ssh.log":"_ssh"}
+    SUSPECT_MIME = frozenset({"application/x-dosexec","application/x-elf",
+                              "application/x-msdownload","application/octet-stream"})
+    RAT_PORTS = {4444,1337,31337,9001,9002}
+
+    def __init__(self, config, dns_d, dga_d, tls_d):
+        self.log_dir = Path(config.get("log_dir","/opt/zeek/logs/current"))
+        self.logs    = config.get("logs",["dns.log","ssl.log","conn.log","http.log","ssh.log"])
+        self.poll    = config.get("poll_interval",0.5)
+        self.dns=dns_d; self.dga=dga_d; self.tls=tls_d
+        self._stop = threading.Event()
+        self._q: queue.Queue = queue.Queue(maxsize=2000)
+        self._fpos: Dict[str,int] = {}
+        self.log = logging.getLogger("ARGUS.Zeek")
+
+    def start(self):
+        threading.Thread(target=self._poll, daemon=True, name="Zeek").start()
+        self.log.info("Zeek consumer actif : %s", self.log_dir)
+
+    def stop(self): self._stop.set()
+
+    def get_alerts(self):
+        out = []
+        try:
+            while True: out.append(self._q.get_nowait())
+        except queue.Empty: pass
+        return out
+
+    def _poll(self):
+        while not self._stop.is_set():
+            for name in self.logs:
+                h = self.HANDLERS.get(name)
+                if not h: continue
+                p = self.log_dir / name
+                if not p.exists(): continue
+                try:
+                    pos = self._fpos.get(str(p),0)
+                    with open(p,"r",errors="replace") as f:
+                        f.seek(pos)
+                        for line in f:
+                            line = line.strip()
+                            if not line or line.startswith("#"): continue
+                            try:
+                                rec = json.loads(line)
+                                fn  = getattr(self, h, None)
+                                if fn:
+                                    for a in (fn(rec) or []):
+                                        a.source = "zeek"
+                                        try: self._q.put_nowait(a)
+                                        except queue.Full: pass
+                            except (json.JSONDecodeError,KeyError): pass
+                        self._fpos[str(p)] = f.tell()
+                except (OSError,IOError): pass
+            time.sleep(self.poll)
+
+    def _dns(self, r):
+        dom = r.get("query",""); alerts = []
+        if not dom: return alerts
+        for fn in (self.dns.analyze, self.dga.analyze):
+            a = fn(dom)
+            if a: a.source_ip = r.get("id.orig_h"); alerts.append(a)
+        return alerts
+
+    def _ssl(self, r):
+        ja3 = r.get("ja3","")
+        if not ja3: return []
+        a = self.tls.analyze(ja3)
+        if a:
+            a.source_ip = r.get("id.orig_h"); a.dest_ip = r.get("id.resp_h")
+            a.detail += f" | SNI={r.get('server_name','?')}"
+        return [a] if a else []
+
+    def _conn(self, r):
+        dp = int(r.get("id.resp_p",0))
+        if dp not in self.RAT_PORTS: return []
+        return [Alert(type="backdoor_behavior",subtype="rat_port",
+            severity="HIGH",confidence="medium",
+            source_ip=r.get("id.orig_h"),dest_ip=r.get("id.resp_h"),port=dp,
+            detail=f"[Zeek] Port RAT {dp} | dur={r.get('duration','?')}s | bytes={r.get('resp_bytes','?')}")]
+
+    def _files(self, r):
+        mime = r.get("mime_type","")
+        if mime not in self.SUSPECT_MIME: return []
+        tx = r.get("tx_hosts",[None])
+        return [Alert(type="zeek_file",subtype="suspect_transfer",
+            severity="HIGH",confidence="medium",
+            source_ip=tx[0] if tx else None,
+            detail=f"[Zeek] Transfert suspect : {mime} ({r.get('total_bytes','?')}B)")]
+
+    def _weird(self, r):
+        name = r.get("name","?")
+        return [Alert(type="zeek_weird",subtype=name,severity="MEDIUM",confidence="medium",
+            source_ip=r.get("id.orig_h"),
+            detail=f"[Zeek] Anomalie : {name} | {r.get('addl','')}")]
+
+    def _http(self, r):
+        """Analyse les logs HTTP Zeek pour SQLi/XSS/Path Traversal."""
+        uri = r.get("uri",""); method = r.get("method",""); ua = r.get("user_agent","").lower()
+        alerts = []
+        sqli_re = re.compile(r"(?:union.+select|insert.+into|drop.+table|xp_cmdshell)", re.I)
+        if sqli_re.search(uri):
+            alerts.append(Alert(
+                type="http_sqli", severity="CRITICAL", confidence="high",
+                source_ip=r.get("id.orig_h"), dest_ip=r.get("id.resp_h"),
+                port=int(r.get("id.resp_p",80)),
+                http_method=method, http_uri=uri[:256],
+                detail=f"[Zeek] SQLi dans URI : {uri[:80]}",
+            ))
+        bad_uas = ["sqlmap","nikto","masscan","havij","w3af","dirbuster"]
+        if any(b in ua for b in bad_uas):
+            alerts.append(Alert(
+                type="port_scan", subtype="http_scanner",
+                severity="MEDIUM", confidence="high",
+                source_ip=r.get("id.orig_h"),
+                http_ua=ua[:128],
+                detail=f"[Zeek] Scanner HTTP UA='{ua[:60]}'",
+            ))
+        return alerts
+
+    def _ssh(self, r):
+        """Détecte les brute-force SSH via logs Zeek."""
+        if r.get("auth_success") == False:
+            return [Alert(
+                type="ssh_bruteforce", subtype="zeek_fail",
+                severity="MEDIUM", confidence="medium",
+                source_ip=r.get("id.orig_h"), dest_ip=r.get("id.resp_h"),
+                port=22,
+                detail=f"[Zeek] Échec auth SSH | client={r.get('client','?')} | user={r.get('auth_attempts','?')} tentatives",
+            )]
+        return []
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 23 — eBPF SENSOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+EBPF_PROG = r"""
+#include <uapi/linux/ptrace.h>
+#include <net/sock.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+BPF_HASH(ip_cnt, u32, u64, 65536);
+BPF_HASH(port_cnt, u16, u64, 65536);
+BPF_PERF_OUTPUT(events);
+struct ev_t { u32 src; u32 dst; u16 sport; u16 dport; u8 reason; u32 cnt; };
+static inline int rat_port(u16 p) {
+    return p==4444||p==1337||p==31337||p==9001||p==9002||p==8443||p==6666||p==55555;
+}
+int kp(struct pt_regs *ctx, struct sock *sk) {
+    struct ev_t e = {};
+    u64 *c, one=1, thr=THRESHOLD;
+    e.src   = sk->__sk_common.skc_rcv_saddr;
+    e.dst   = sk->__sk_common.skc_daddr;
+    e.sport = sk->__sk_common.skc_num;
+    e.dport = ntohs(sk->__sk_common.skc_dport);
+    c = ip_cnt.lookup_or_try_init(&e.src, &one);
+    if (c) { (*c)++; e.cnt=*c; if(*c>thr){e.reason=2;events.perf_submit(ctx,&e,sizeof(e));} }
+    if (rat_port(e.dport)||rat_port(e.sport)) { e.reason=1; events.perf_submit(ctx,&e,sizeof(e)); }
+    return 0;
+}
+"""
+
+class EBPFSensor:
+    def __init__(self, config):
+        self.cfg = config; self.enabled = config.get("enabled",False) and EBPF_OK
+        self._q: queue.Queue = queue.Queue(maxsize=5000)
+        self._bpf = None; self._stop = threading.Event()
+        self.log = logging.getLogger("ARGUS.eBPF")
+
+    def start(self):
+        if not self.enabled: return False
+        try:
+            src = EBPF_PROG.replace("THRESHOLD", str(self.cfg.get("drop_threshold",500)))
+            self._bpf = BPF(text=src)
+            self._bpf.attach_kprobe(event="tcp_v4_rcv", fn_name="kp")
+            self._bpf.attach_kprobe(event="udp_rcv",    fn_name="kp")
+            self._bpf["events"].open_perf_buffer(self._cb)
+            threading.Thread(target=self._poll, daemon=True, name="eBPF").start()
+            self.log.info("eBPF actif | seuil=%d pkt/s", self.cfg.get("drop_threshold",500))
+            return True
+        except Exception as e:
+            self.log.error("eBPF init : %s", e)
+            self.enabled = False; return False
+
+    def _cb(self, cpu, data, size):
+        try:
+            e   = self._bpf["events"].event(data)
+            src = self._ip(e.src); dst = self._ip(e.dst)
+            port = e.dport or e.sport
+            if e.reason == 1:
+                a = Alert(type="backdoor_behavior",subtype="rat_port_ebpf",
+                    severity="HIGH",confidence="high",source_ip=src,dest_ip=dst,
+                    port=port,detail=f"[eBPF] Port RAT {port} kernel-space",source="ebpf")
+            else:
+                a = Alert(type="port_scan",subtype="high_rate_ebpf",
+                    severity="MEDIUM",confidence="medium",source_ip=src,dest_ip=dst,
+                    port=port,detail=f"[eBPF] Taux élevé : {e.cnt} pkt/s depuis {src}",source="ebpf")
+            try: self._q.put_nowait(a)
+            except queue.Full: pass
+        except Exception: pass
+
+    def _poll(self):
+        while not self._stop.is_set():
+            try: self._bpf.perf_buffer_poll(timeout=100)
+            except Exception: time.sleep(0.1)
+
+    def get_alerts(self):
+        out = []
+        try:
+            while True: out.append(self._q.get_nowait())
+        except queue.Empty: pass
+        return out
+
+    def stop(self): self._stop.set()
+
+    @staticmethod
+    def _ip(n): return f"{n&0xff}.{(n>>8)&0xff}.{(n>>16)&0xff}.{(n>>24)&0xff}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 24 — LLM ANALYZER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class LLMAnalyzer:
+    SEV_ORD = {"LOW":1,"MEDIUM":2,"HIGH":3,"CRITICAL":4}
+
+    def __init__(self, config, yara_sc=None):
+        self.enabled = config.get("enabled",False) and REQUESTS_OK
+        self.log = logging.getLogger("ARGUS.LLM")
+        if not self.enabled: return
+        self.endpoint   = config.get("endpoint","")
+        self.api_key    = config.get("api_key","")
+        self.model      = config.get("model","gpt-4o-mini")
+        self.max_tokens = config.get("max_tokens",800)
+        self.timeout    = config.get("timeout",30)
+        self.template   = config.get("prompt_template","Analyse: {alert_json}")
+        self.min_sev    = config.get("min_severity","HIGH")
+        self.yara       = yara_sc
+        self._q: queue.Queue = queue.Queue(maxsize=config.get("queue_size",100))
+        self._res: Dict[str,Dict] = {}; self._lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True, name="LLM").start()
+        self.log.info("LLM actif : %s", self.model)
+
+    def _run(self):
+        while True:
+            a = self._q.get()
+            try: self._analyze(a)
+            except Exception as e: self.log.error("LLM : %s", e)
+
+    def _analyze(self, alert: Alert):
+        safe = {k: getattr(alert,k,None) for k in
+                ["type","severity","confidence","mitre_id","mitre_tactic",
+                 "kill_chain","detail","source_ip","domain","cve_id",
+                 "lgbm_score","bssid","ssid","geo_country","threat_intel"]}
+        prompt  = self.template.format(alert_json=json.dumps(safe, indent=2))
+        headers = {"Authorization":f"Bearer {self.api_key}","Content-Type":"application/json"}
+        body    = {"model":self.model,"messages":[
+            {"role":"system","content":"Tu es un analyste cybersécurité SOC/CERT. JSON uniquement."},
+            {"role":"user","content":prompt}],
+            "max_tokens":self.max_tokens,"temperature":0.1}
+        resp = http_req.post(self.endpoint, headers=headers, json=body, timeout=self.timeout)
+        if resp.status_code != 200: return
+        raw    = resp.json()["choices"][0]["message"]["content"]
+        parsed = self._validate(raw)
+        if not parsed: return
+        alert.llm_analysis = parsed
+        inc = (alert.brain or {}).get("incident_id","")
+        if inc:
+            with self._lock: self._res[inc] = parsed
+        if parsed.get("yara_rule") and self.yara:
+            self.yara.add_rule(parsed["yara_rule"])
+
+    def _validate(self, raw):
+        clean = re.sub(r"```(?:json)?","",raw).strip()
+        try: data = json.loads(clean)
+        except json.JSONDecodeError: return None
+        required = {"explanation","mitigation","risk_score","false_positive_likelihood"}
+        if not required.issubset(data): return None
+        try: data["risk_score"] = max(1,min(10,int(data["risk_score"])))
+        except: data["risk_score"] = 5
+        if data["false_positive_likelihood"] not in ("low","medium","high"):
+            data["false_positive_likelihood"] = "medium"
+        return data
+
+    def submit(self, alert: Alert):
+        if not self.enabled: return
+        if self.SEV_ORD.get(alert.severity,0) < self.SEV_ORD.get(self.min_sev,3): return
+        try: self._q.put_nowait(alert)
+        except queue.Full: pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 25 — RL RESPONSE AGENT (étendu)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RLResponseAgent:
+    SEV  = {"LOW":1,"MEDIUM":2,"HIGH":3,"CRITICAL":4}
+    CONF = {"low":1,"medium":2,"high":3}
+
+    def __init__(self, config):
+        self.enabled = config.get("enabled",False) and SK_OK and NP_OK
+        self.log = logging.getLogger("ARGUS.RL")
+        if not self.enabled: return
+        self.lr      = config.get("learning_rate",0.05)
+        self.eps     = config.get("epsilon",0.15)
+        self.eps_dec = config.get("epsilon_decay",0.9995)
+        self.eps_min = config.get("epsilon_min",0.01)
+        self.rw      = config.get("reward_window",120)
+        self.feats   = config.get("features",["severity_score","confidence_score",
+                                               "alert_frequency","distinct_alert_types",
+                                               "geo_risk","threat_intel_score"])
+        self.actions = config.get("actions",["allow","throttle","block","isolate","honeypot"])
+        self.spath   = config.get("model_save_path","output/rl_model.pkl")
+        self._aidx   = {a:i for i,a in enumerate(self.actions)}
+        nf = len(self.feats)
+        self._iph: Dict[str,deque] = defaultdict(lambda: deque(maxlen=200))
+        self._pend: Dict[str,List] = {}
+        self._lock = threading.Lock()
+        self.scaler = StandardScaler()
+        self.qm = [SGDRegressor(learning_rate="constant",eta0=self.lr,warm_start=True) for _ in self.actions]
+        dummy = np.zeros((2,nf)); dummy[1,0]=1.0
+        self.scaler.fit(dummy)
+        for m in self.qm: m.fit(dummy,[0.0,0.0])
+        self._load()
+        self.log.info("RL actif | actions=%s | ε=%.2f", self.actions, self.eps)
+
+    def _state(self, alert, ip):
+        h = self._iph.get(ip, deque()); now = time.time()
+        freq  = sum(1 for ts,_ in h if now-ts<300)
+        types = len(set(t for _,t in h if now-_<300))
+        vec = []
+        for f in self.feats:
+            if f=="severity_score":        vec.append(self.SEV.get(alert.severity,1))
+            elif f=="confidence_score":    vec.append(self.CONF.get(alert.confidence,1))
+            elif f=="alert_frequency":     vec.append(min(freq,50))
+            elif f=="distinct_alert_types":vec.append(min(types,10))
+            elif f=="geo_risk":            vec.append(alert.geo_risk)
+            elif f=="threat_intel_score":  vec.append(1.0 if alert.threat_intel else 0.0)
+            else:                          vec.append(0.0)
+        return np.array(vec,dtype=float).reshape(1,-1)
+
+    def select_action(self, alert):
+        if not self.enabled: return "allow"
+        ip = alert.source_ip or alert.bssid or "?"
+        raw = self._state(alert,ip); sc = self.scaler.transform(raw)
+        action = (random.choice(self.actions) if np.random.random()<self.eps
+                  else self.actions[int(np.argmax([m.predict(sc)[0] for m in self.qm]))])
+        self.eps = max(self.eps_min, self.eps*self.eps_dec)
+        with self._lock:
+            self._iph[ip].append((time.time(),alert.type))
+            self._pend[ip] = [action, sc, time.time(), {alert.type}]
+        return action
+
+    def record_repeat(self, ip, alert_type):
+        if not self.enabled: return
+        with self._lock:
+            if ip not in self._pend: return
+            action,state,_,types = self._pend[ip]
+            types.add(alert_type)
+            r = -1.0 if action in ("block","isolate","honeypot") else -0.5
+            self._update(ip,action,state,r)
+
+    def evaluate_pending(self):
+        if not self.enabled: return
+        now = time.time()
+        with self._lock:
+            for ip,(action,state,ts,types) in list(self._pend.items()):
+                if now-ts >= self.rw:
+                    r = +2.0 if action in ("block","isolate","honeypot") else +0.5
+                    self._update(ip,action,state,r)
+                    del self._pend[ip]
+
+    def _update(self, ip, action, state, reward):
+        self.qm[self._aidx.get(action,0)].partial_fit(state,[reward])
+        self._save()
+
+    def _save(self):
+        try:
+            Path(self.spath).parent.mkdir(parents=True, exist_ok=True)
+            with open(self.spath,"wb") as f:
+                pickle.dump({"scaler":self.scaler,"models":self.qm,
+                             "epsilon":self.eps,"actions":self.actions},f)
+        except Exception: pass
+
+    def _load(self):
+        if not Path(self.spath).exists(): return
+        try:
+            with open(self.spath,"rb") as f: d=pickle.load(f)
+            self.scaler=d["scaler"]; self.qm=d["models"]; self.eps=d.get("epsilon",self.eps)
+        except Exception as e: self.log.warning("RL load : %s",e)
+
+    @property
+    def status(self):
+        return {"enabled":self.enabled,"epsilon":round(self.eps,4),
+                "pending_ips":len(self._pend) if self.enabled else 0,
+                "actions":self.actions}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 26 — SIEM EXPORTER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SIEMExporter:
+    def __init__(self, path):
+        self._path = Path(path); self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._count = 0
+        self.log = logging.getLogger("ARGUS.SIEM")
+
+    def export(self, alert: Alert):
+        rec = {"schema_version":"3.0",**alert.to_dict()}
+        try:
+            with self._lock:
+                with open(self._path,"a",encoding="utf-8") as f:
+                    f.write(json.dumps(rec)+"\n")
+            self._count += 1
+        except OSError as e: self.log.error("SIEM : %s",e)
+
+    def export_csv(self, out_path: str = "output/alerts_export.csv") -> str:
+        """Exporte toutes les alertes en CSV."""
+        if not self._path.exists(): return ""
+        rows = []
+        for line in self._path.read_text(encoding="utf-8").splitlines():
+            try: rows.append(json.loads(line))
+            except: pass
+        if not rows: return ""
+        keys = ["timestamp_iso","type","severity","source_ip","dest_ip",
+                "domain","cve_id","mitre_id","action","geo_country","detail"]
+        with open(out_path,"w",newline="",encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+            w.writeheader(); w.writerows(rows)
+        self.log.info("CSV exporté : %s (%d alertes)", out_path, len(rows))
+        return out_path
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 27 — REPORT GENERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+REPORT_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>ARGUS-AI v9.0 — Rapport d'Incident</title>
+<style>
+  body{font-family:monospace;background:#05080f;color:#cfd8dc;padding:20px}
+  h1{color:#00e5ff;border-bottom:2px solid #162235;padding-bottom:8px}
+  h2{color:#00bcd4;margin-top:20px}
+  table{width:100%;border-collapse:collapse;margin:10px 0}
+  th{background:#0b1120;color:#00e5ff;padding:6px 10px;text-align:left}
+  td{padding:5px 10px;border-bottom:1px solid #162235}
+  .CRITICAL{color:#ff1744}.HIGH{color:#ff9100}.MEDIUM{color:#ffd600}.LOW{color:#00e676}
+  .badge{padding:2px 6px;border-radius:3px;font-size:.8em;background:#0b1120}
+  .section{background:#0b1120;border:1px solid #162235;padding:14px;border-radius:4px;margin:12px 0}
+  .stat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:10px 0}
+  .stat-box{background:#0b1120;border:1px solid #162235;padding:12px;text-align:center;border-radius:4px}
+  .stat-val{font-size:2em;font-weight:bold;color:#00e5ff}
+  .stat-lbl{color:#546e7a;font-size:.85em}
+  pre{background:#070d18;padding:10px;overflow-x:auto;font-size:.8em}
+</style>
+</head>
+<body>
+<h1>⬡ ARGUS-AI v9.0 — Rapport de Sécurité</h1>
+<p>Généré le : <strong>{{generated_at}}</strong> | Période : dernières 24h</p>
+<div class="section">
+  <h2>📊 Résumé Exécutif</h2>
+  <div class="stat-grid">
+    <div class="stat-box"><div class="stat-val">{{total}}</div><div class="stat-lbl">Alertes Totales</div></div>
+    <div class="stat-box"><div class="stat-val" style="color:#ff1744">{{critical}}</div><div class="stat-lbl">CRITICAL</div></div>
+    <div class="stat-box"><div class="stat-val" style="color:#ff9100">{{high}}</div><div class="stat-lbl">HIGH</div></div>
+    <div class="stat-box"><div class="stat-val" style="color:#00e676">{{blocked}}</div><div class="stat-lbl">IPs Bloquées</div></div>
+  </div>
+</div>
+<div class="section">
+  <h2>🌍 Distribution Géographique</h2>
+  <table><tr><th>Pays</th><th>Alertes</th><th>Risque</th></tr>
+  {{geo_rows}}
+  </table>
+</div>
+<div class="section">
+  <h2>🎯 Top Attaquants (24h)</h2>
+  <table><tr><th>IP Source</th><th>Pays</th><th>Alertes</th><th>Risque Max</th></tr>
+  {{attacker_rows}}
+  </table>
+</div>
+<div class="section">
+  <h2>📋 Dernières Alertes Critiques</h2>
+  <table><tr><th>Heure</th><th>Type</th><th>Sévérité</th><th>IP Source</th><th>MITRE</th><th>Détail</th></tr>
+  {{alert_rows}}
+  </table>
+</div>
+<div class="section">
+  <h2>🛡️ IPs Bloquées</h2>
+  <table><tr><th>IP</th><th>Raison</th><th>Bloquée à</th></tr>
+  {{block_rows}}
+  </table>
+</div>
+<p style="color:#546e7a;font-size:.8em;margin-top:20px">
+  ARGUS-AI IDS v9.0 — Rapport confidentiel — Usage interne SOC uniquement
+</p>
+</body>
+</html>"""
+
+class ReportGenerator:
+    def __init__(self, config: Dict, db: DatabaseManager):
+        self.config     = config
+        self.db         = db
+        self.report_dir = Path(config.get("report_dir", "output/reports"))
+        self.report_dir.mkdir(parents=True, exist_ok=True)
+        self.log        = logging.getLogger("ARGUS.Report")
+
+    def generate_html(self, blocks: List[Dict] = None) -> str:
+        stats = self.db.recent_stats()
+        attackers = self.db.get_top_attackers(limit=10)
+        blocked   = self.db.get_active_blocks()
+
+        # Stats de base
+        total    = stats.get("total", 0)
+        by_sev   = stats.get("by_severity", {})
+        by_geo   = stats.get("by_country", {})
+        critical = by_sev.get("CRITICAL", 0)
+        high     = by_sev.get("HIGH", 0)
+
+        # Rows HTML
+        HIGH_RISK = {"CN","RU","KP","IR","SY","CU","SD"}
+        geo_rows = "\n".join(
+            f"<tr><td>{c}</td><td>{n}</td>"
+            f"<td class='{'CRITICAL' if c in HIGH_RISK else 'LOW'}'>{'⚠ HIGH RISK' if c in HIGH_RISK else 'Normal'}</td></tr>"
+            for c, n in sorted(by_geo.items(), key=lambda x: -x[1])[:10]
+        )
+
+        attacker_rows = "\n".join(
+            f"<tr><td><code>{a['ip']}</code></td><td>{a.get('country','?')}</td>"
+            f"<td>{a['count']}</td><td>{a.get('max_risk','?')}</td></tr>"
+            for a in attackers
+        )
+
+        # Dernières alertes critiques depuis SIEM
+        siem = Path(self.config.get("siem_file","output/siem_export.jsonl"))
+        recent_alerts = []
+        if siem.exists():
+            lines = siem.read_text(encoding="utf-8").strip().split("\n")
+            for l in reversed(lines[-200:]):
+                try:
+                    d = json.loads(l)
+                    if d.get("severity") in ("CRITICAL","HIGH"):
+                        recent_alerts.append(d)
+                        if len(recent_alerts) >= 20: break
+                except: pass
+
+        alert_rows = "\n".join(
+            f"<tr><td>{a.get('timestamp_iso','?')[:19]}</td>"
+            f"<td>{a.get('type','?')}</td>"
+            f"<td class='{a.get('severity','LOW')}'>{a.get('severity','?')}</td>"
+            f"<td>{a.get('source_ip','?')}</td>"
+            f"<td>{a.get('mitre_id','?')}</td>"
+            f"<td>{str(a.get('detail',''))[:80]}</td></tr>"
+            for a in recent_alerts
+        )
+
+        block_rows = "\n".join(
+            f"<tr><td><code>{b['ip']}</code></td>"
+            f"<td>{b.get('reason','?')[:60]}</td>"
+            f"<td>{datetime.fromtimestamp(b.get('blocked_at',0)).strftime('%Y-%m-%d %H:%M')}</td></tr>"
+            for b in blocked[:20]
+        )
+
+        html = REPORT_HTML_TEMPLATE
+        html = html.replace("{{generated_at}}", datetime.now().isoformat())
+        html = html.replace("{{total}}", str(total))
+        html = html.replace("{{critical}}", str(critical))
+        html = html.replace("{{high}}", str(high))
+        html = html.replace("{{blocked}}", str(len(blocked)))
+        html = html.replace("{{geo_rows}}", geo_rows)
+        html = html.replace("{{attacker_rows}}", attacker_rows)
+        html = html.replace("{{alert_rows}}", alert_rows)
+        html = html.replace("{{block_rows}}", block_rows)
+
+        fname = self.report_dir / f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        fname.write_text(html, encoding="utf-8")
+        self.log.info("Rapport généré : %s", fname)
+        return str(fname)
+
+    def schedule_daily(self) -> None:
+        def _loop():
+            while True:
+                time.sleep(86400)
+                try: self.generate_html()
+                except Exception as e: self.log.error("Report auto : %s", e)
+        threading.Thread(target=_loop, daemon=True, name="DailyReport").start()
+        self.log.info("Rapport automatique quotidien activé")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 28 — ALERT ENRICHER
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AlertEnricher:
+    """Enrichit chaque alerte avec GeoIP, Threat Intel, etc."""
+    def __init__(self, geoip: GeoIPResolver, ti: ThreatIntelligence):
+        self.geo = geoip
+        self.ti  = ti
+        self.log = logging.getLogger("ARGUS.Enricher")
+
+    def enrich(self, alert: Alert) -> Alert:
+        # GeoIP
+        ip = alert.source_ip
+        if ip and not FastMath.is_private_ip(ip):
+            geo = self.geo.lookup(ip)
+            alert.geo_country = geo.get("country","")
+            alert.geo_city    = geo.get("city","")
+            alert.geo_asn     = geo.get("asn","")
+            alert.geo_risk    = geo.get("risk", 0.0)
+
+        # Threat Intel — IP
+        if ip:
+            is_bad, risk, src = self.ti.check_ip(ip)
+            if is_bad:
+                alert.threat_intel = True
+                alert.ioc_match    = f"ip:{ip} [{src}]"
+                alert.severity     = "CRITICAL"
+                alert.detail      += f" [IOC:{src}]"
+                if alert.type not in ("threat_intel_hit",):
+                    alert.type = "threat_intel_hit"
+
+        # Threat Intel — Domain
+        if alert.domain:
+            is_bad, matched = self.ti.check_domain(alert.domain)
+            if is_bad:
+                alert.threat_intel = True
+                alert.ioc_match    = f"domain:{matched}"
+                alert.detail      += f" [IOC-DOMAIN:{matched}]"
+
+        return alert
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 29 — DASHBOARD HTML v9 (enrichi)
+# ══════════════════════════════════════════════════════════════════════════════
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>ARGUS-AI v9.0 — Cognitive Defence Platform</title>
+  <script src="https://cdn.socket.io/4.6.0/socket.io.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Exo+2:wght@300;600&display=swap');
+    :root{
+      --bg:#05080f;--panel:#0b1120;--border:#162235;--accent:#00e5ff;
+      --crit:#ff1744;--high:#ff9100;--med:#ffd600;--low:#00e676;
+      --llm:#e040fb;--rl:#40c4ff;--lgbm:#69f0ae;--zeek:#ff6e40;--ebpf:#b2ff59;
+      --wifi:#f48fb1;--w0:#00bcd4;--w1:#ff5722;--ti:#e040fb;--geo:#ff8a65;
+      --text:#cfd8dc;--dim:#546e7a;
+    }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:var(--bg);color:var(--text);font-family:'Share Tech Mono',monospace;overflow:hidden}
+    #layout{display:grid;grid-template-rows:50px 40px 28px 1fr 180px;
+      grid-template-columns:1fr 320px;height:100vh}
+    #header,#statsbar,#ifacebar{grid-column:1/-1}
+    #feed{overflow-y:auto;padding:6px 12px;border-right:1px solid var(--border)}
+    #sidebar{overflow-y:auto;padding:6px 10px;border-right:1px solid var(--border)}
+    #charts{grid-column:1/-1;display:grid;grid-template-columns:repeat(4,1fr);
+      border-top:1px solid var(--border);padding:6px 12px;gap:8px}
+    #header{display:flex;align-items:center;justify-content:space-between;
+      background:var(--panel);border-bottom:1px solid var(--border);padding:0 16px}
+    #header h1{font-family:'Exo 2',sans-serif;font-weight:600;font-size:.82rem;
+      color:var(--accent);letter-spacing:3px}
+    #statsbar{display:flex;align-items:center;background:#070d18;
+      border-bottom:1px solid var(--border);font-size:.68rem;padding:0 16px;overflow-x:auto;gap:0}
+    .stat{padding:0 10px;border-right:1px solid var(--border);white-space:nowrap}
+    .sv{font-size:.82rem;font-weight:bold}.sl{color:var(--dim);margin-left:2px}
+    #ifacebar{display:flex;align-items:center;gap:0;
+      background:#03060e;border-bottom:1px solid var(--border);font-size:.65rem;padding:0 16px}
+    .iface-block{padding:0 12px;border-right:1px solid var(--border);display:flex;align-items:center;gap:5px}
+    .iface-dot{width:6px;height:6px;border-radius:50%}
+    .iface-dot.up{background:var(--low);box-shadow:0 0 4px var(--low);animation:pulse 2s infinite}
+    .iface-dot.down{background:var(--dim)}
+    .card{border-left:3px solid var(--dim);background:var(--panel);
+      margin-bottom:4px;padding:6px 10px;border-radius:2px;font-size:.7rem;
+      animation:slide .14s ease}
+    .card.CRITICAL{border-color:var(--crit)}.card.HIGH{border-color:var(--high)}
+    .card.MEDIUM{border-color:var(--med)}.card.LOW{border-color:var(--low)}
+    .card.wifi{border-style:dashed}
+    .card.ti_hit{background:#1a0020;border-color:var(--ti);border-width:2px}
+    .cr{display:flex;justify-content:space-between;align-items:center;margin-bottom:1px}
+    .ct{font-weight:bold;text-transform:uppercase;letter-spacing:1px;font-size:.72rem}
+    .CRITICAL .ct{color:var(--crit)}.HIGH .ct{color:var(--high)}
+    .MEDIUM .ct{color:var(--med)}.LOW .ct{color:var(--low)}
+    .badge{font-size:.58rem;padding:1px 4px;border-radius:2px;background:#0d1929;
+      color:var(--accent);margin-left:2px;display:inline-block}
+    .badge.rl{color:var(--rl);background:#001d2e}
+    .badge.llm{color:var(--llm);background:#1a0020}
+    .badge.lgbm{color:var(--lgbm);background:#00200d}
+    .badge.zeek{color:var(--zeek);background:#200800}
+    .badge.ebpf{color:var(--ebpf);background:#0d1800}
+    .badge.w0{color:var(--w0);background:#001d20}
+    .badge.w1{color:var(--w1);background:#1a0800}
+    .badge.wifi{color:var(--wifi);background:#1a0010}
+    .badge.ti{color:var(--ti);background:#1a001a}
+    .badge.geo{color:var(--geo);background:#1a0800}
+    .cd{color:var(--dim);margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:.68rem}
+    .cb{color:#607d8b;font-size:.63rem;margin-top:1px}
+    .st{font-family:'Exo 2',sans-serif;font-size:.66rem;color:var(--dim);
+      letter-spacing:2px;text-transform:uppercase;margin:8px 0 4px}
+    .ir{display:flex;justify-content:space-between;padding:3px 0;
+      border-bottom:1px solid #0d1929;font-size:.67rem}
+    .track{background:#0d1929;border-radius:2px;height:4px;overflow:hidden;margin:2px 0}
+    .fill-rl{height:100%;background:var(--rl);transition:width .4s}
+    .fill-lgbm{height:100%;background:var(--lgbm);transition:width .4s}
+    .chart-wrap{background:var(--panel);border:1px solid var(--border);
+      border-radius:3px;padding:6px;min-height:0}
+    .chart-title{font-size:.63rem;color:var(--dim);margin-bottom:3px;letter-spacing:1px}
+    @keyframes slide{from{opacity:0;transform:translateX(-4px)}to{opacity:1;transform:none}}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+    ::-webkit-scrollbar{width:2px}::-webkit-scrollbar-thumb{background:var(--border)}
+    .mod{font-size:.62rem;padding:1px 4px;border-radius:2px;margin-left:3px;display:none}
+    .act-block{background:#3d0000;color:var(--crit)}.act-isolate{background:#4a0000;color:var(--crit)}
+    .act-throttle{background:#3d2b00;color:var(--high)}.act-allow{background:#003d0d;color:var(--low)}
+    .act-honeypot{background:#1a002a;color:var(--llm)}
+  </style>
+</head>
+<body>
+<div id="layout">
+  <header id="header">
+    <h1>⬡ ARGUS-AI v9.0 &nbsp;·&nbsp; COGNITIVE DEFENCE PLATFORM &nbsp;·&nbsp; wlan0/wlan1</h1>
+    <div style="display:flex;align-items:center;gap:3px">
+      <span id="m-llm"  class="mod" style="color:var(--llm)">LLM</span>
+      <span id="m-rl"   class="mod" style="color:var(--rl)">RL</span>
+      <span id="m-lgbm" class="mod" style="color:var(--lgbm)">LGBM</span>
+      <span id="m-zeek" class="mod" style="color:var(--zeek)">ZEEK</span>
+      <span id="m-ebpf" class="mod" style="color:var(--ebpf)">eBPF</span>
+      <span id="m-cext" class="mod" style="color:#aaa">C-EXT</span>
+      <span id="m-wifi" class="mod" style="color:var(--wifi)">802.11</span>
+      <span id="m-ti"   class="mod" style="color:var(--ti)">THREAT-INTEL</span>
+      <span id="m-geo"  class="mod" style="color:var(--geo)">GEOIP</span>
+      <div style="width:6px;height:6px;border-radius:50%;background:var(--low);
+        box-shadow:0 0 4px var(--low);animation:pulse 2s infinite;margin-left:5px"></div>
+    </div>
+  </header>
+
+  <div id="statsbar">
+    <div class="stat"><span class="sv" id="s-tot">0</span><span class="sl">ALERTES</span></div>
+    <div class="stat"><span class="sv" style="color:var(--crit)" id="s-crit">0</span><span class="sl">CRIT</span></div>
+    <div class="stat"><span class="sv" style="color:var(--high)" id="s-high">0</span><span class="sl">HIGH</span></div>
+    <div class="stat"><span class="sv" style="color:var(--rl)"   id="s-blk">0</span><span class="sl">BLOQUÉS</span></div>
+    <div class="stat"><span class="sv" style="color:var(--ti)"   id="s-ti">0</span><span class="sl">IOC</span></div>
+    <div class="stat"><span class="sv" style="color:var(--wifi)" id="s-wifi">0</span><span class="sl">Wi-Fi</span></div>
+    <div class="stat"><span class="sv" style="color:var(--lgbm)" id="s-lgbm">0</span><span class="sl">LGBM</span></div>
+    <div class="stat"><span class="sv" style="color:var(--zeek)" id="s-zeek">0</span><span class="sl">ZEEK</span></div>
+    <div class="stat"><span class="sv" style="color:var(--ebpf)" id="s-ebpf">0</span><span class="sl">eBPF</span></div>
+    <div class="stat" style="border:none"><span id="up" style="color:var(--dim)">00:00:00</span><span class="sl"> UP</span></div>
+  </div>
+
+  <div id="ifacebar">
+    <div class="iface-block"><div class="iface-dot" id="dot-w0"></div>
+      <span style="color:var(--w0)" id="lbl-w0">wlan0</span></div>
+    <div class="iface-block"><div class="iface-dot" id="dot-w1"></div>
+      <span style="color:var(--w1)" id="lbl-w1">wlan1mon</span></div>
+    <div class="iface-block"><span id="chan-lbl" style="color:var(--dim)">Canal: —</span></div>
+    <div class="iface-block" style="border:none">
+      <span id="ti-lbl" style="color:var(--ti)">IOC: —</span></div>
+    <div style="margin-left:auto;color:var(--dim);font-size:.63rem" id="db-lbl">DB: —</div>
+  </div>
+
+  <div id="feed"><div id="fl"></div></div>
+
+  <div id="sidebar">
+    <div class="st">Top Attaquants</div><div id="ip-list"></div>
+    <div class="st" style="margin-top:10px">Géolocalisation</div><div id="geo-list"></div>
+    <div class="st" style="margin-top:10px">Réseaux Wi-Fi</div><div id="ap-list"></div>
+    <div class="st" style="margin-top:10px">RL Agent <span id="rl-e" style="color:var(--dim)"></span></div>
+    <div class="track"><div class="fill-rl" id="rl-f" style="width:15%"></div></div>
+    <div class="st" style="margin-top:6px">LGBM Score Moyen</div>
+    <div class="track"><div class="fill-lgbm" id="lg-f" style="width:0%"></div></div>
+    <div id="lg-v" style="font-size:.66rem;color:var(--dim)">—</div>
+    <div class="st" style="margin-top:10px">Sources</div><div id="src-list"></div>
+    <div class="st" style="margin-top:10px">Types d'Attaques</div><div id="type-list"></div>
+  </div>
+
+  <div id="charts">
+    <div class="chart-wrap">
+      <div class="chart-title">SÉVÉRITÉ (24h)</div>
+      <canvas id="cSev" height="140"></canvas>
+    </div>
+    <div class="chart-wrap">
+      <div class="chart-title">TOP TYPES</div>
+      <canvas id="cTypes" height="140"></canvas>
+    </div>
+    <div class="chart-wrap">
+      <div class="chart-title">SOURCES</div>
+      <canvas id="cSrc" height="140"></canvas>
+    </div>
+    <div class="chart-wrap">
+      <div class="chart-title">KILL CHAIN</div>
+      <canvas id="cChain" height="140"></canvas>
+    </div>
+  </div>
+</div>
+
+<script>
+var io=io();
+var st={tot:0,crit:0,high:0,blk:0,wifi:0,lgbm:0,zeek:0,ebpf:0,ti:0};
+var t0=Date.now(),ips={},types={},aps={},srcs={},lgbs=[],geo={},chains={};
+var charts={};
+function pad(n){return String(n).padStart(2,'0')}
+
+setInterval(function(){
+  var s=~~((Date.now()-t0)/1000);
+  document.getElementById('up').textContent=pad(~~(s/3600))+':'+pad(~~(s%3600/60))+':'+pad(s%60);
+},1000);
+
+io.on('modules',function(m){
+  ['llm','rl','lgbm','zeek','ebpf','cext','wifi','ti','geo'].forEach(function(k){
+    if(m[k]){var el=document.getElementById('m-'+k);if(el)el.style.display='';}
+  });
+});
+
+io.on('iface_status',function(d){
+  var w0=document.getElementById('dot-w0'),w1=document.getElementById('dot-w1');
+  w0.className='iface-dot '+(d.wlan0?'up':'down');
+  w1.className='iface-dot '+(d.wlan1?'up':'down');
+  document.getElementById('lbl-w0').textContent='wlan0 '+(d.wlan0?'UP':'DOWN');
+  document.getElementById('lbl-w1').textContent=(d.mon_if||'wlan1')+' '+(d.wlan1?'MON':'DOWN');
+  if(d.channel) document.getElementById('chan-lbl').textContent='Canal: '+d.channel;
+  if(d.ioc_stats) document.getElementById('ti-lbl').textContent=
+    'IOC: '+d.ioc_stats.bad_ips+' IPs / '+d.ioc_stats.bad_domains+' domaines';
+  if(d.db_total!==undefined) document.getElementById('db-lbl').textContent='DB: '+d.db_total+' alertes';
+});
+
+io.on('new_alert',function(a){
+  st.tot++;
+  if(a.severity==='CRITICAL') st.crit++;
+  if(a.severity==='HIGH') st.high++;
+  if(a.action&&['block','isolate','honeypot'].includes(a.action)) st.blk++;
+  if(a.threat_intel) st.ti++;
+  if(['wifi_deauth','wifi_evil_twin','wifi_pmkid','wifi_probe','wifi_handshake','arp_spoofing'].includes(a.type)) st.wifi++;
+  if(a.lgbm_score!=null){st.lgbm++;lgbs.push(a.lgbm_score);if(lgbs.length>300)lgbs.shift();}
+  if(a.source==='zeek') st.zeek++;
+  if(a.source==='ebpf') st.ebpf++;
+  ['tot','crit','high','blk','ti','wifi','lgbm','zeek','ebpf'].forEach(k=>
+    document.getElementById('s-'+k).textContent=st[k]);
+
+  var key=a.source_ip||a.mac_src||a.bssid||a.domain||'?';
+  if(!ips[key]) ips[key]={c:0,action:'allow',type:a.type,country:a.geo_country||''};
+  ips[key].c++; if(a.action) ips[key].action=a.action;
+  if(a.geo_country) geo[a.geo_country]=(geo[a.geo_country]||0)+1;
+  types[a.type]=(types[a.type]||0)+1;
+  srcs[a.source||'wlan0']=(srcs[a.source||'wlan0']||0)+1;
+  if(a.ssid) aps[a.bssid||a.ssid]={ssid:a.ssid,bssid:a.bssid,ch:a.channel,cnt:(aps[a.bssid||a.ssid]||{cnt:0}).cnt+1};
+  if(a.kill_chain&&a.kill_chain!=='unknown') chains[a.kill_chain]=(chains[a.kill_chain]||0)+1;
+
+  var ts=new Date(a.timestamp*1000).toLocaleTimeString('fr');
+  var sev=a.severity||'LOW';
+  var isWifi=['wifi_deauth','wifi_evil_twin','wifi_pmkid','wifi_probe','wifi_handshake','arp_spoofing'].includes(a.type);
+  var srcBadge='';
+  if(a.source==='wlan0')srcBadge='<span class="badge w0">wlan0</span>';
+  else if(a.source==='wlan1')srcBadge='<span class="badge w1">wlan1</span>';
+  else if(a.source==='zeek')srcBadge='<span class="badge zeek">ZEEK</span>';
+  else if(a.source==='ebpf')srcBadge='<span class="badge ebpf">eBPF</span>';
+  var mitre=a.mitre_id&&a.mitre_id!=='unknown'?'<span class="badge">'+a.mitre_id+'</span>':'';
+  var rl_b=a.action&&a.action!=='allow'?'<span class="badge rl act-'+a.action+'">RL:'+a.action.toUpperCase()+'</span>':'';
+  var lg_b=a.lgbm_score!=null?'<span class="badge lgbm">'+a.lgbm_score.toFixed(2)+'</span>':'';
+  var wf_b=isWifi?'<span class="badge wifi">802.11</span>':'';
+  var llm_b=a.llm_analysis?'<span class="badge llm">LLM✓</span>':'';
+  var ti_b=a.threat_intel?'<span class="badge ti">⚠IOC</span>':'';
+  var geo_b=a.geo_country?'<span class="badge geo">'+a.geo_country+'</span>':'';
+  var brain='';
+  if(a.brain) brain='<div class="cb">🧠 '+a.brain.incident_id+' | '+a.brain.recommended_action
+    +' | '+a.brain.risk_score+'/10 ['+a.brain.scored_by+']'
+    +(a.brain.escalate?' ⚠ESC':'')
+    +(a.brain.kill_chain_stages>1?' 🔗KC:'+a.brain.kill_chain_stages:'')+'</div>';
+  var extra='';
+  if(a.ssid) extra+='<div class="cb" style="color:var(--wifi)">📶 '+a.ssid+(a.channel?' CH'+a.channel:'')+(a.rssi?' '+a.rssi+'dBm':'')+'</div>';
+  if(a.geo_country&&!isWifi) extra+='<div class="cb" style="color:var(--geo)">🌍 '+a.geo_country+(a.geo_city?' / '+a.geo_city:'')+'</div>';
+  if(a.http_uri) extra+='<div class="cb" style="color:var(--high)">🌐 '+a.http_method+' '+a.http_uri.slice(0,60)+'</div>';
+
+  var isTI=a.threat_intel;
+  var card=document.createElement('div');
+  card.className='card '+sev+(isWifi?' wifi':'')+(isTI?' ti_hit':'');
+  card.innerHTML='<div class="cr"><span class="ct">'+(a.type||'').replace(/_/g,' ')
+    +mitre+srcBadge+rl_b+lg_b+wf_b+llm_b+ti_b+geo_b+'</span>'
+    +'<span style="color:var(--dim);font-size:.62rem">'+ts+'</span></div>'
+    +'<div style="font-size:.67rem;color:var(--text)">'+(a.source_ip||a.mac_src||a.domain||'')+'</div>'
+    +'<div class="cd">'+(a.detail||'').slice(0,120)+'</div>'+brain+extra;
+  var fl=document.getElementById('fl');
+  fl.insertBefore(card,fl.firstChild);
+  while(fl.children.length>300) fl.removeChild(fl.lastChild);
+  renderAll();
+  updateCharts();
+});
+
+io.on('rl_status',function(s){
+  document.getElementById('rl-e').textContent='ε='+s.epsilon;
+  document.getElementById('rl-f').style.width=(s.epsilon*100)+'%';
+});
+
+function renderAll(){
+  // IPs
+  document.getElementById('ip-list').innerHTML=
+    Object.entries(ips).sort((a,b)=>b[1].c-a[1].c).slice(0,10).map(([k,d])=>
+      '<div class="ir"><span style="font-size:.65rem">'+k.slice(0,18)+'</span>'
+      +(d.country?'<span style="color:var(--geo);font-size:.62rem">'+d.country+'</span>':'')
+      +'<span style="color:var(--accent)">'+d.c+'</span>'
+      +'<span class="badge act-'+d.action+'">'+d.action.toUpperCase()+'</span></div>').join('');
+  // Geo
+  document.getElementById('geo-list').innerHTML=
+    Object.entries(geo).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([c,n])=>
+      '<div class="ir"><span style="color:var(--geo)">'+c+'</span>'
+      +'<span style="color:var(--accent)">'+n+'</span></div>').join('');
+  // APs
+  document.getElementById('ap-list').innerHTML=
+    Object.entries(aps).sort((a,b)=>b[1].cnt-a[1].cnt).slice(0,6).map(([k,v])=>
+      '<div class="ir"><span style="color:var(--wifi)">'+(v.ssid||'?').slice(0,14)+'</span>'
+      +'<span style="color:var(--dim);font-size:.63rem">'+(v.ch?'CH'+v.ch:'')+'</span>'
+      +'<span style="color:var(--accent)">'+v.cnt+'</span></div>').join('');
+  // Sources
+  var sc={'wlan0':'var(--w0)','wlan1':'var(--w1)','zeek':'var(--zeek)',
+          'ebpf':'var(--ebpf)','simulator':'var(--dim)'};
+  document.getElementById('src-list').innerHTML=
+    Object.entries(srcs).sort((a,b)=>b[1]-a[1]).map(([s,c])=>
+      '<div class="ir"><span style="color:'+(sc[s]||'var(--text)')+'">'+s+'</span>'
+      +'<span style="color:var(--accent)">'+c+'</span></div>').join('');
+  // Types
+  document.getElementById('type-list').innerHTML=
+    Object.entries(types).sort((a,b)=>b[1]-a[1]).slice(0,8).map(([t,c])=>
+      '<div class="ir"><span>'+t.replace(/_/g,' ')+'</span>'
+      +'<span style="color:var(--accent)">'+c+'</span></div>').join('');
+  // LGBM
+  if(lgbs.length){
+    var avg=lgbs.reduce((a,b)=>a+b,0)/lgbs.length;
+    document.getElementById('lg-f').style.width=(avg*100)+'%';
+    document.getElementById('lg-v').textContent='Moy '+(avg*10).toFixed(2)+'/10 ('+lgbs.length+' éch.)';
+  }
+}
+
+function updateCharts(){
+  // Chart Sévérité
+  var sevData=[st.crit,st.high,
+    Object.values(types).reduce((a,b)=>a+b,0)-st.crit-st.high,0];
+  if(!charts.sev){
+    var ctx=document.getElementById('cSev').getContext('2d');
+    charts.sev=new Chart(ctx,{type:'doughnut',data:{
+      labels:['CRITICAL','HIGH','OTHER'],
+      datasets:[{data:[0,0,0],backgroundColor:['#ff1744','#ff9100','#00e676'],borderWidth:0}]
+    },options:{plugins:{legend:{labels:{color:'#546e7a',font:{size:10}}}}}});
+  }
+  charts.sev.data.datasets[0].data=[st.crit,st.high,Math.max(0,st.tot-st.crit-st.high)];
+  charts.sev.update('none');
+  // Chart Types
+  var typeArr=Object.entries(types).sort((a,b)=>b[1]-a[1]).slice(0,5);
+  if(!charts.types){
+    var ctx=document.getElementById('cTypes').getContext('2d');
+    charts.types=new Chart(ctx,{type:'bar',data:{labels:[],datasets:[{
+      data:[],backgroundColor:'#00e5ff55',borderColor:'#00e5ff',borderWidth:1
+    }]},options:{indexAxis:'y',plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:'#546e7a',font:{size:9}}},y:{ticks:{color:'#546e7a',font:{size:9}}}}}});
+  }
+  charts.types.data.labels=typeArr.map(([t])=>t.replace(/_/g,' ').slice(0,16));
+  charts.types.data.datasets[0].data=typeArr.map(([,c])=>c);
+  charts.types.update('none');
+  // Chart Sources
+  var srcArr=Object.entries(srcs);
+  var srcColors={'wlan0':'#00bcd4','wlan1':'#ff5722','zeek':'#ff6e40','ebpf':'#b2ff59','simulator':'#546e7a'};
+  if(!charts.src){
+    var ctx=document.getElementById('cSrc').getContext('2d');
+    charts.src=new Chart(ctx,{type:'pie',data:{labels:[],datasets:[{
+      data:[],backgroundColor:Object.values(srcColors),borderWidth:0
+    }]},options:{plugins:{legend:{labels:{color:'#546e7a',font:{size:9}}}}}});
+  }
+  charts.src.data.labels=srcArr.map(([s])=>s);
+  charts.src.data.datasets[0].data=srcArr.map(([,c])=>c);
+  charts.src.data.datasets[0].backgroundColor=srcArr.map(([s])=>srcColors[s]||'#546e7a');
+  charts.src.update('none');
+  // Kill Chain
+  var chainArr=Object.entries(chains).sort((a,b)=>b[1]-a[1]);
+  if(!charts.chain){
+    var ctx=document.getElementById('cChain').getContext('2d');
+    charts.chain=new Chart(ctx,{type:'bar',data:{labels:[],datasets:[{
+      data:[],backgroundColor:'#e040fb55',borderColor:'#e040fb',borderWidth:1
+    }]},options:{indexAxis:'y',plugins:{legend:{display:false}},
+      scales:{x:{ticks:{color:'#546e7a',font:{size:9}}},y:{ticks:{color:'#546e7a',font:{size:9}}}}}});
+  }
+  charts.chain.data.labels=chainArr.map(([c])=>c.slice(0,16));
+  charts.chain.data.datasets[0].data=chainArr.map(([,v])=>v);
+  charts.chain.update('none');
+}
+setInterval(updateCharts,5000);
+</script></body></html>"""
+
+
+def create_dashboard(sio, db: DatabaseManager, report_gen: ReportGenerator,
+                     pcap_exp: PCAPExporter, ti: ThreatIntelligence) -> Flask:
+    app = Flask(__name__)
+
+    @app.route("/")
+    def index(): return render_template_string(DASHBOARD_HTML)
+
+    @app.route("/api/alerts")
+    def api_alerts():
+        n = int(freq.args.get("n",100))
+        sev = freq.args.get("severity")
+        p   = Path("output/siem_export.jsonl")
+        if not p.exists(): return jsonify([])
+        lines = p.read_text(encoding="utf-8").strip().split("\n")
+        out = []
+        for l in lines[-n*3:]:
+            try:
+                d = json.loads(l)
+                if sev and d.get("severity") != sev: continue
+                out.append(d)
+            except: pass
+        return jsonify(out[-n:])
+
+    @app.route("/api/stats")
+    def api_stats(): return jsonify(db.recent_stats())
+
+    @app.route("/api/attackers")
+    def api_attackers(): return jsonify(db.get_top_attackers())
+
+    @app.route("/api/blocked")
+    def api_blocked(): return jsonify(db.get_active_blocks())
+
+    @app.route("/api/ioc/stats")
+    def api_ioc_stats(): return jsonify(ti.stats)
+
+    @app.route("/api/pcap/list")
+    def api_pcap(): return jsonify(pcap_exp.list_captures())
+
+    @app.route("/api/pcap/download/<filename>")
+    def api_pcap_dl(filename):
+        fname = Path("output/pcap") / filename
+        if fname.exists() and fname.suffix == ".pcap":
+            return send_file(str(fname), as_attachment=True)
+        return jsonify({"error":"not found"}), 404
+
+    @app.route("/api/report/generate")
+    def api_report():
+        fname = report_gen.generate_html()
+        return jsonify({"file": fname, "status": "generated"})
+
+    @app.route("/api/report/view")
+    def api_report_view():
+        reports = sorted(Path("output/reports").glob("*.html"), key=lambda f: f.stat().st_mtime, reverse=True)
+        if reports:
+            return reports[0].read_text(encoding="utf-8")
+        return "No report available yet. Call /api/report/generate first.", 404
+
+    @app.route("/api/db/alerts")
+    def api_db():
+        if not SA_OK: return jsonify({"error":"SQLAlchemy non disponible"})
+        sev = freq.args.get("severity"); src = freq.args.get("source")
+        lim = int(freq.args.get("limit",100))
+        try:
+            with db.SessionLocal() as sess:
+                q = sess.query(AlertRecord)
+                if sev: q = q.filter(AlertRecord.severity==sev)
+                if src: q = q.filter(AlertRecord.source==src)
+                rows = q.order_by(AlertRecord.timestamp.desc()).limit(lim).all()
+                return jsonify([{
+                    "incident_id":r.incident_id,"timestamp":r.timestamp,
+                    "type":r.type,"severity":r.severity,"source_ip":r.source_ip,
+                    "geo_country":r.geo_country,"threat_intel":r.threat_intel,
+                    "bssid":r.bssid,"ssid":r.ssid,"risk_score":r.risk_score,
+                    "lgbm_score":r.lgbm_score,"action":r.action,
+                    "source":r.source,"detail":r.detail,"cve_id":r.cve_id,
+                    "mitre_id":r.mitre_id,"kill_chain":r.kill_chain,
+                } for r in rows])
+        except Exception as e: return jsonify({"error":str(e)})
+
+    @app.route("/api/ioc/add", methods=["POST"])
+    def api_ioc_add():
+        data = freq.get_json() or {}
+        ioc_type = data.get("type","ip"); value = data.get("value","")
+        if not value: return jsonify({"error":"value required"}), 400
+        ti.add_ioc(ioc_type, value, source="api_manual")
+        return jsonify({"status":"added","type":ioc_type,"value":value})
+
+    @app.route("/api/export/csv")
+    def api_csv():
+        siem = SIEMExporter("output/siem_export.jsonl")
+        path = siem.export_csv()
+        if path and Path(path).exists():
+            return send_file(path, as_attachment=True, download_name="argus_alerts.csv")
+        return jsonify({"error":"no data"}), 404
+
+    return app
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 30 — TRAFFIC SIMULATOR (enrichi)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TrafficSimulator:
+    BENIGN  = ["google.com","github.com","microsoft.com","stackoverflow.com","ubuntu.com"]
+    SUSPECT = ["ajd92kd83k.com","x7f2k9pq1m3v.net","a1b2c3d4e5f6.xyz"]
+    C2      = "c2.beacon-hidden.io"
+    TLS_FPS = ["modern_browser_tls","a0e9f5d64349fb13191bc781f81f42e1",
+               "6bea65232c1288defa4bf058f5e99601","unknown_tls_lib"]
+    IPS_EXT = ["185.220.101.1","94.102.49.12","91.108.4.11","45.33.32.156"]
+    IPS_INT = ["10.0.0.10","192.168.1.42","172.16.3.7","10.10.10.99"]
+    MACS    = ["aa:bb:cc:11:22:33","de:ad:be:ef:00:01","11:22:33:44:55:66"]
+    BSSIDS  = ["00:11:22:33:44:55","aa:bb:cc:dd:ee:ff"]
+    SSIDS   = ["FreeWifi","MonReseau","ARGUS-Lab","Corp-WiFi"]
+    WIFI_TYPES = ["wifi_deauth","wifi_probe","wifi_evil_twin","wifi_handshake","wifi_pmkid","arp_spoofing"]
+    SCAN_TYPES  = ["port_scan","ssh_bruteforce","http_sqli","http_xss","http_path_traversal"]
+    EXFIL_TYPES = ["dns_tunnel","data_exfil","lateral_movement"]
+
+    def __init__(self, pipeline, interval=1.5):
+        self.pipeline = pipeline; self.interval = interval
+        self._stop = threading.Event()
+        self.log = logging.getLogger("ARGUS.Sim")
+
+    def _event(self):
+        r = random.random()
+        if r < 0.15:
+            # Wi-Fi
+            wtype = random.choice(self.WIFI_TYPES)
+            alerts = [Alert(
+                type=wtype, severity=random.choice(["HIGH","CRITICAL","MEDIUM"]),
+                confidence="medium", source="wlan1",
+                bssid=random.choice(self.BSSIDS), ssid=random.choice(self.SSIDS),
+                mac_src=random.choice(self.MACS), channel=random.randint(1,13),
+                rssi=random.randint(-90,-30),
+                detail=f"[SIM] {wtype}",
+            )]
+            self.pipeline._enqueue(alerts)
+        elif r < 0.30:
+            # Scan / Brute-force
+            stype = random.choice(self.SCAN_TYPES)
+            ip    = random.choice(self.IPS_EXT)
+            alerts = [Alert(
+                type=stype, severity="HIGH", confidence="high",
+                source_ip=ip, source="wlan0",
+                detail=f"[SIM] {stype} depuis {ip}",
+                http_method="GET" if "http" in stype else None,
+                http_uri="/admin?id=1 UNION SELECT 1,2,3--" if stype=="http_sqli" else None,
+            )]
+            self.pipeline._enqueue(alerts)
+        elif r < 0.45:
+            # Exfiltration / Latéral
+            etype = random.choice(self.EXFIL_TYPES)
+            ip    = random.choice(self.IPS_INT)
+            alerts = [Alert(
+                type=etype, severity="CRITICAL", confidence="high",
+                source_ip=ip, source="wlan0",
+                bytes_out=random.randint(1024*1024, 100*1024*1024),
+                detail=f"[SIM] {etype} depuis {ip}",
+            )]
+            self.pipeline._enqueue(alerts)
+        else:
+            # Trafic réseau standard
+            dom = (self.C2 if r<0.55 else
+                   random.choice(self.SUSPECT) if r<0.70 else
+                   random.choice(self.BENIGN))
+            fp  = random.choice(self.TLS_FPS)
+            ip  = random.choice(self.IPS_EXT + self.IPS_INT)
+            self.pipeline.process_synthetic(dom, fp, ip)
+
+    def start(self):
+        self.log.info("Simulateur actif | intervalle=%.1fs", self.interval)
+        while not self._stop.is_set():
+            try: self._event()
+            except Exception as e: self.log.error("Sim : %s", e)
+            time.sleep(self.interval)
+
+    def stop(self): self._stop.set()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 31 — PIPELINE MASTER v9
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ARGUSPipelineV9:
+    def __init__(self, config: Dict, iface_mgr: KaliInterfaceManager, socketio_=None):
+        self.config     = config
+        self.iface      = iface_mgr
+        self.auto_block = config.get("interfaces",{}).get("auto_block", False)
+        self.learning   = config.get("interfaces",{}).get("learning_mode", False)
+        self.sio        = socketio_
+        self._stop      = threading.Event()
+
+        # Infrastructure
+        self.db   = DatabaseManager(config)
+        self.siem = SIEMExporter(config.get("siem_file","output/siem_export.jsonl"))
+        self.pcap = PCAPExporter(config)
+
+        # Intelligence
+        self.mitre  = MitreMapper()
+        self.geoip  = GeoIPResolver(config.get("geoip_db","data/GeoLite2-City.mmdb"))
+        self.ti     = ThreatIntelligence(config, self.db)
+        self.enrich = AlertEnricher(self.geoip, self.ti)
+
+        # Détecteurs réseau
+        self.dns      = DNSBeaconDetector(config)
+        self.tls      = TLSAnalyzer()
+        self.dga      = DGADetector(config.get("model_path","models/dga_model.pkl"))
+        self.yara     = YaraScanner(config.get("yara_rules","rules/yara_rules.yar"))
+        self.bof      = BufferOverflowDetector(config)
+        self.backdoor = BackdoorDetector()
+        self.cve      = CVEMatcher()
+        self.wifi_det = WiFiDetector(config)
+
+        # Nouveaux détecteurs
+        self.port_scan  = PortScanDetector(config)
+        self.ssh_bf     = SSHBruteForceDetector(config)
+        self.http_anom  = HTTPAnomalyDetector(config)
+        self.dns_tunnel = DNSTunnelingDetector(config)
+        self.lateral    = LateralMovementDetector(config)
+        self.data_exfil = DataExfiltrationDetector(config)
+
+        # ML
+        self.lgbm  = LGBMCorrelationModel(config.get("lgbm",{}), self.db)
+        self.brain = ARGUSBrain(config, self.mitre, self.lgbm, self.db)
+
+        # Response
+        self.llm      = LLMAnalyzer(config.get("llm",{}), self.yara)
+        self.rl       = RLResponseAgent(config.get("rl_agent",{}))
+        self.playbook = IncidentPlaybook(config, iface_mgr, self.db, self.ti)
+
+        # Reporting
+        self.report = ReportGenerator(config, self.db)
+        self.report.schedule_daily()
+
+        # Sources externes
+        self.zeek: Optional[ZeekConsumer] = None
+        if config.get("zeek",{}).get("enabled",False):
+            self.zeek = ZeekConsumer(config["zeek"], self.dns, self.dga, self.tls)
+            self.zeek.start()
+
+        self.ebpf: Optional[EBPFSensor] = None
+        if config.get("ebpf",{}).get("enabled",False):
+            self.ebpf = EBPFSensor(config["ebpf"])
+            if not self.ebpf.start(): self.ebpf = None
+
+        # Channel hopping Wi-Fi
+        self.hopper: Optional[ChannelHopper] = None
+        if (config.get("wifi",{}).get("channel_hop",True)
+                and config.get("interfaces",{}).get("monitor_mode",False)):
+            self.hopper = ChannelHopper(config, iface_mgr)
+            self.hopper.start()
+
+        # Bus événements
+        self._bus: queue.Queue = queue.Queue(maxsize=20000)
+        threading.Thread(target=self._dispatch_loop, daemon=True, name="Dispatcher").start()
+        threading.Thread(target=self._poll_sensors,  daemon=True, name="SensorPoll").start()
+        if self.rl.enabled:
+            threading.Thread(target=self._rl_loop, daemon=True, name="RL-Reward").start()
+        if self.sio:
+            threading.Thread(target=self._broadcast_loop, daemon=True, name="Broadcast").start()
+
+        if self.sio:
+            self.sio.emit("modules",{
+                "llm":  self.llm.enabled,    "rl":   self.rl.enabled,
+                "lgbm": self.lgbm.enabled,   "zeek": self.zeek is not None,
+                "ebpf": self.ebpf is not None,"cext": CEXT_OK,
+                "wifi": True,                 "ti":   self.ti.enabled,
+                "geo":  self.geoip._db is not None,
+            })
+
+        self.pkt_count = 0; self.alert_count = 0
+        self.blocked: Set[str] = set(); self.start_time = datetime.now()
+        self.log = logging.getLogger("ARGUS.Pipeline")
+        self.log.info(
+            "Pipeline v9.0 prêt | wlan0=%s wlan1=%s LGBM=%s RL=%s TI=%s GeoIP=%s",
+            iface_mgr.wlan0, iface_mgr.wlan1,
+            self.lgbm.enabled, self.rl.enabled,
+            self.ti.enabled, self.geoip._db is not None,
+        )
+
+    # ── Bus ──────────────────────────────────────────────────────────────
+
+    def _enqueue(self, alerts):
+        if alerts:
+            try: self._bus.put_nowait(alerts)
+            except queue.Full: self.log.warning("Bus saturé — %d alertes perdues", len(alerts))
+
+    def _dispatch_loop(self):
+        while not self._stop.is_set():
+            try: self._dispatch(self._bus.get(timeout=0.5))
+            except queue.Empty: continue
+
+    # ── Capteur wlan0 (IP/TCP/UDP) ────────────────────────────────────────
+
+    def process_packet(self, pkt):
+        self.pkt_count += 1
+        alerts = []
+
+        # Détecteurs classiques
+        alerts.extend(self.bof.analyze(pkt))
+        alerts.extend(self.backdoor.analyze(pkt))
+        alerts.extend(self.cve.analyze(pkt))
+
+        # Nouveaux détecteurs
+        alerts.extend(self.port_scan.analyze(pkt))
+        alerts.extend(self.ssh_bf.analyze(pkt))
+        alerts.extend(self.http_anom.analyze(pkt))
+        alerts.extend(self.data_exfil.analyze(pkt))
+        if SCAPY_OK and pkt.haslayer(IP):
+            alerts.extend(self.lateral.analyze(pkt))
+
+        # DNS (scapy)
+        if SCAPY_OK and pkt.haslayer(DNS):
+            alerts.extend(self.dns_tunnel.analyze(pkt))
+        if SCAPY_OK and pkt.haslayer(DNSQR):
+            dom = pkt[DNSQR].qname.decode(errors="replace").rstrip(".")
+            for fn in (self.dns.analyze, self.dga.analyze):
+                a = fn(dom)
+                if a: a.source="wlan0"; alerts.append(a)
+
+        # TLS JA3
+        ja3 = self.tls.compute_ja3(pkt)
+        if ja3:
+            a = self.tls.analyze(hashlib.md5(ja3.encode()).hexdigest())
+            if a: a.source="wlan0"; alerts.append(a)
+
+        # YARA
+        if SCAPY_OK and pkt.haslayer(Raw) and YARA_OK:
+            m = self.yara.scan(bytes(pkt[Raw].load))
+            if m:
+                src = pkt[IP].src if pkt.haslayer(IP) else "?"
+                alerts.append(Alert(type="yara_match",severity="CRITICAL",confidence="high",
+                    source_ip=src,yara_rules=m,source="wlan0",
+                    detail=f"YARA match : {', '.join(m)}"))
+
+        # ARP
+        if SCAPY_OK and pkt.haslayer(ARP):
+            alerts.extend(self.wifi_det._check_arp(pkt))
+
+        for a in alerts: a.source = a.source or "wlan0"
+        self._enqueue(alerts)
+
+        # PCAP pour paquets suspects
+        if alerts and self.pcap.enabled:
+            for a in alerts:
+                if a.severity in ("CRITICAL","HIGH"):
+                    self.pcap.capture(pkt, a)
+                    break
+
+        if self.pkt_count % 10000 == 0: self._print_stats()
+
+    # ── Capteur wlan1mon (802.11) ─────────────────────────────────────────
+
+    def process_wifi_packet(self, pkt):
+        alerts = self.wifi_det.analyze(pkt)
+        for a in alerts: a.source = "wlan1"
+        self._enqueue(alerts)
+        if alerts and self.pcap.enabled:
+            for a in alerts:
+                if a.severity == "CRITICAL":
+                    self.pcap.capture(pkt, a); break
+
+    # ── Synthétique ───────────────────────────────────────────────────────
+
+    def process_synthetic(self, domain, fp, src_ip=None):
+        alerts = []
+        for fn in (self.dns.analyze, self.dga.analyze):
+            a = fn(domain)
+            if a: a.source_ip=src_ip; a.source="simulator"; alerts.append(a)
+        a = self.tls.analyze(fp)
+        if a: a.source_ip=src_ip; a.source="simulator"; alerts.append(a)
+        self._enqueue(alerts)
+
+    # ── Dispatch ──────────────────────────────────────────────────────────
+
+    def _dispatch(self, alerts):
+        # Multi-signal correlation
+        if len(alerts) >= 2:
+            for a in alerts:
+                a.severity = "CRITICAL"
+                a.detail  += " [MULTI-SIGNAL]"
+
+        for alert in alerts:
+            alert.timestamp = time.time()
+            self.alert_count += 1
+
+            # 1. Enrichissement
+            alert = self.enrich.enrich(alert)
+
+            # 2. Brain (MITRE + LGBM + corrélation)
+            if not self.learning:
+                self.brain.process(alert)
+
+            # 3. RL Agent
+            if self.rl.enabled and (alert.source_ip or alert.bssid):
+                key = alert.source_ip or alert.bssid
+                self.rl.record_repeat(key, alert.type)
+
+            if self.rl.enabled and not self.learning:
+                action = self.rl.select_action(alert)
+                alert.action = action
+                ip = alert.source_ip
+                if action in ("block","isolate") and self.auto_block and ip:
+                    if ip not in self.blocked:
+                        self.iface.block_ip(ip, f"RL:{alert.type}")
+                        self.db.add_blocked_ip(ip, f"RL-{action}:{alert.type}", expires_h=24)
+                        self.blocked.add(ip)
+                    alert.detail += f" [RL-{action.upper()}]"
+                elif action == "honeypot" and ip:
+                    self.iface.add_honeypot_rule(ip)
+                elif action == "throttle" and ip:
+                    self.iface.throttle_ip(ip)
+            else:
+                if self.auto_block and not self.learning and alert.brain:
+                    rec = alert.brain.get("recommended_action","")
+                    if rec in ("BLOCK_IP","ISOLATE"):
+                        ip = alert.source_ip
+                        if ip and ip not in self.blocked:
+                            self.iface.block_ip(ip, f"Brain:{alert.type}")
+                            self.blocked.add(ip)
+
+            # 4. Playbook
+            if not self.learning and alert.severity in ("CRITICAL","HIGH"):
+                self.playbook.execute(alert, self.iface)
+
+            # 5. LLM
+            if self.llm.enabled: self.llm.submit(alert)
+
+            # 6. Persistance
+            inc = (alert.brain or {}).get("incident_id") or self.db.next_incident_id()
+            self.db.insert_alert(alert, inc)
+            self.siem.export(alert)
+
+            # 7. Dashboard
+            if self.sio: self.sio.emit("new_alert", alert.to_dict())
+
+            # 8. Console
+            self._print_alert(alert)
+
+    # ── Polling capteurs externes ─────────────────────────────────────────
+
+    def _poll_sensors(self):
+        while not self._stop.is_set():
+            alerts = []
+            if self.zeek: alerts.extend(self.zeek.get_alerts())
+            if self.ebpf: alerts.extend(self.ebpf.get_alerts())
+            if alerts: self._enqueue(alerts)
+            time.sleep(0.1)
+
+    def _rl_loop(self):
+        while not self._stop.is_set():
+            self.rl.evaluate_pending(); time.sleep(15)
+
+    def _broadcast_loop(self):
+        while not self._stop.is_set():
+            if self.rl.enabled: self.sio.emit("rl_status", self.rl.status)
+            avail = self.iface.check_interfaces()
+            self.sio.emit("iface_status",{
+                "wlan0":    avail.get(self.iface.wlan0, False),
+                "wlan1":    avail.get(self.iface.wlan1, False),
+                "mon_if":   self.iface.mon_if,
+                "channel":  self.hopper.current_channel if self.hopper else None,
+                "db_total": self.alert_count,
+                "ioc_stats":self.ti.stats,
+            })
+            self.sio.emit("modules",{
+                "llm":self.llm.enabled,"rl":self.rl.enabled,"lgbm":self.lgbm.enabled,
+                "zeek":self.zeek is not None,"ebpf":self.ebpf is not None,
+                "cext":CEXT_OK,"wifi":True,"ti":self.ti.enabled,
+                "geo":self.geoip._db is not None,
+            })
+            time.sleep(4)
+
+    # ── Console ───────────────────────────────────────────────────────────
+
+    def _print_alert(self, alert: Alert):
+        C = {"CRITICAL":"\033[91m","HIGH":"\033[93m","MEDIUM":"\033[94m","LOW":"\033[92m"}
+        c = C.get(alert.severity,"\033[0m"); R = "\033[0m"
+        ts = datetime.fromtimestamp(alert.timestamp).strftime("%H:%M:%S")
+        geo_info  = f" [{alert.geo_country}]" if alert.geo_country else ""
+        ti_info   = " ⚠IOC" if alert.threat_intel else ""
+        lg_info   = f" LGBM={alert.lgbm_score:.3f}" if alert.lgbm_score is not None else ""
+        kc_info   = f" KC={alert.kill_chain}" if alert.kill_chain != "unknown" else ""
+        wifi_info = ""
+        if alert.ssid:
+            wifi_info = f"\n  📶 SSID={alert.ssid} BSSID={alert.bssid} CH={alert.channel}"
+        http_info = ""
+        if alert.http_uri:
+            http_info = f"\n  🌐 {alert.http_method} {str(alert.http_uri)[:80]}"
+        print(
+            f"\n{c}╔{'═'*84}╗\n"
+            f"  🚨 [{alert.severity:8s}] {alert.type.upper():<26s} [{alert.source.upper():<9s}] {alert.mitre_id}{kc_info}\n"
+            f"  📍 src={str(alert.source_ip or alert.mac_src or alert.domain or '?'):<22s}"
+            f"conf={alert.confidence:<7s} ts={ts}{geo_info}{ti_info}{lg_info}\n"
+            f"  💬 {str(alert.detail)[:120]}"
+            + wifi_info + http_info
+            + (f"\n  🤖 RL→{alert.action.upper()}" if alert.action!="allow" else "")
+            + (f"\n  🧠 {alert.brain['incident_id']} | {alert.brain['recommended_action']}"
+               f" | {alert.brain['risk_score']}/10 [{alert.brain['scored_by']}]"
+               + (" ⚠ESCALADE" if alert.brain.get("escalate") else "")
+               if alert.brain else "")
+            + f"\n╚{'═'*84}╝{R}"
+        )
+
+    def _print_stats(self):
+        up = datetime.now() - self.start_time
+        self.log.info(
+            "Stats | uptime=%s pkts=%d alertes=%d bloqués=%d | IOC:%s",
+            str(up).split(".")[0], self.pkt_count, self.alert_count,
+            len(self.blocked), str(self.ti.stats)
+        )
+
+    # ── Sniffing ──────────────────────────────────────────────────────────
+
+    def start_sniffing_wlan0(self):
+        if not SCAPY_OK: self.log.error("Scapy manquant."); return
+        self.log.info("Sniffing wlan0 : %s", self.iface.wlan0)
+        try:
+            sniff(iface=self.iface.wlan0, prn=self.process_packet,
+                  store=False, filter="ip or arp")
+        except PermissionError: self.log.error("Permission refusée — lancez avec sudo")
+        except KeyboardInterrupt: pass
+        finally: self._print_stats()
+
+    def start_sniffing_wlan1(self):
+        if not SCAPY_OK: return
+        mon = self.iface.mon_if
+        self.log.info("Sniffing 802.11 : %s", mon)
+        try:
+            sniff(iface=mon, prn=self.process_wifi_packet, store=False)
+        except PermissionError: self.log.error("Permission refusée sur %s", mon)
+        except KeyboardInterrupt: pass
+
+    def shutdown(self):
+        self._stop.set()
+        if self.zeek:  self.zeek.stop()
+        if self.ebpf:  self.ebpf.stop()
+        if self.hopper:self.hopper.stop()
+        self.iface.disable_monitor_mode()
+        self.log.info("Pipeline arrêté proprement.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 32 — CLI
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        prog="argus_ids_v9_kali.py",
+        description="ARGUS-AI v9.0 — Cognitive Defence Platform (Kali Professional)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+
